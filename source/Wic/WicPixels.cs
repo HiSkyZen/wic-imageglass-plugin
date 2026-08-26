@@ -26,12 +26,19 @@ internal readonly record struct PixelPlan(Guid TargetFormat, IGPixelFormat IgFor
 internal static unsafe class WicPixels
 {
     /// <summary>
+    /// Whether the host understands <see cref="IGHdrTransferFn.ScRgb"/>; set once from the ABI
+    /// version handed to <c>ig_plugin_get_api</c>, before any codec call can run.
+    /// </summary>
+    public static bool HostSupportsScRgb { get; set; }
+
+
+    /// <summary>
     /// Picks the host-facing format for <paramref name="sourceFormat"/>.
     /// <para>
     /// The classification is driven by WIC's own numeric-representation metadata rather than a
     /// GUID whitelist, so a pixel format introduced by a third-party codec is classified
-    /// correctly too. Float and fixed-point formats are extended-range (scene-referred) by
-    /// definition in WIC, which is exactly what <see cref="IGHdrTransferFn.Linear"/> means.
+    /// correctly too. WIC infers scRGB for every float and fixed-point format, so those are
+    /// <see cref="IGHdrTransferFn.ScRgb"/>, NOT the scene-referred <see cref="IGHdrTransferFn.Linear"/>.
     /// </para>
     /// </summary>
     public static PixelPlan Choose(IWICImagingFactory* factory, Guid sourceFormat)
@@ -55,8 +62,11 @@ internal static unsafe class WicPixels
 
         if (isExtendedRange)
         {
+            // Linear is the pre-1.1 spelling: wrong by 203/80, but an old host at least tone-maps.
+            var extendedFn = HostSupportsScRgb ? IGHdrTransferFn.ScRgb : IGHdrTransferFn.Linear;
+
             return new PixelPlan(Apis.GUID_WICPixelFormat64bppRGBAHalf,
-                IGPixelFormat.RgbaFloat16, 8, IGHdrTransferFn.Linear, hasAlpha);
+                IGPixelFormat.RgbaFloat16, 8, extendedFn, hasAlpha);
         }
 
         // Deep but ordinary integer formats (16 bit per channel TIFF, PNG, JXR, camera raw)

@@ -2,7 +2,7 @@
   "id": "Plugin_WicCodec",
   "name": "WIC Codec",
   "description": "Reads and writes every image format the Windows Imaging Component has a codec for, including JPEG XR (.jxr, .hdp, .wdp) and any WIC codec you install from the Microsoft Store. Formats are discovered from Windows at startup; untick the ones you want left to the built-in decoders in Settings > Plugins.",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "Duong Dieu Phap",
   "website": "https://github.com/d2phap/wic-imageglass-plugin",
   "kind": "Codec",

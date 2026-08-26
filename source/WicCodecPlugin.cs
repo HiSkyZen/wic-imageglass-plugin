@@ -19,7 +19,7 @@ internal static unsafe class WicCodecPlugin
 
     private const string PluginIdString = "Plugin_WicCodec";
     private const string PluginNameString = "WIC Codec";
-    private const string VersionString = "1.0.0";
+    private const string VersionString = "1.1.0";
     private const string CodecIdString = "plugin.wic.codec";
     private const string CodecNameString = "WIC Codec";
 
@@ -27,6 +27,10 @@ internal static unsafe class WicCodecPlugin
     // plugin is an explicit act of trust, so the host honors this verbatim; the per-extension
     // tick boxes in Settings > Plugins are how a user hands an individual format back.
     private const int Priority = 300;
+
+    // IGHdrTransferFn.ScRgb arrived in ABI minor 1; an older host maps the unknown value to None
+    // and skips tone mapping entirely, which blows out every extended-range image.
+    private const int ScRgbHostAbiVersion = 1_001_000;
 
     private static IGPluginApi* _pluginApi;
     private static IGCodecApi* _codecApi;
@@ -44,6 +48,8 @@ internal static unsafe class WicCodecPlugin
         // Major-version mismatch: refuse to load.
         if (hostAbiVersion / 1_000_000 != IGNativeAbi.IG_PLUGIN_ABI_MAJOR) return null;
         if (hostApi == null) return null;
+
+        WicPixels.HostSupportsScRgb = hostAbiVersion >= ScRgbHostAbiVersion;
 
         if (_pluginApi != null) return _pluginApi;
         HostChannel.Attach(hostApi);
