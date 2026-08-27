@@ -19,7 +19,7 @@ internal static unsafe class WicCodecPlugin
 
     private const string PluginIdString = "Plugin_WicCodec";
     private const string PluginNameString = "WIC Codec";
-    private const string VersionString = "1.1.0";
+    private const string VersionString = "1.2.0";
     private const string CodecIdString = "plugin.wic.codec";
     private const string CodecNameString = "WIC Codec";
 
@@ -162,6 +162,30 @@ internal static unsafe class WicCodecPlugin
 
 
     [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static IGStatus CodecDecodeStaticRasterScaled(IGStringRef filePath, int frameIndex,
+        int maxWidth, int maxHeight, IGPixelBuffer* outBuf, void* cancellation)
+    {
+        if (outBuf == null) return IGStatus.InvalidArg;
+        *outBuf = default;
+
+        try
+        {
+            if (!TryGetPath(filePath, out var path)) return IGStatus.InvalidArg;
+            return WicDecode.DecodeScaled(path, frameIndex, maxWidth, maxHeight, outBuf, cancellation);
+        }
+        catch (OutOfMemoryException)
+        {
+            return IGStatus.OutOfMemory;
+        }
+        catch (Exception ex)
+        {
+            HostChannel.Log(4, $"WicCodec: DecodeStaticRasterScaled failed. {ex}");
+            return IGStatus.Internal;
+        }
+    }
+
+
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
     private static void CodecFreePixelBuffer(IGPixelBuffer* buf)
     {
         if (buf == null || buf->Data == null) return;
@@ -294,6 +318,7 @@ internal static unsafe class WicCodecPlugin
 
         _codecApi->LoadMetadata = &CodecLoadMetadata;
         _codecApi->DecodeStaticRaster = &CodecDecodeStaticRaster;
+        _codecApi->DecodeStaticRasterScaled = &CodecDecodeStaticRasterScaled;
         _codecApi->FreePixelBuffer = &CodecFreePixelBuffer;
 
         _codecApi->GetAnimationInfo = null;

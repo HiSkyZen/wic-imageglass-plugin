@@ -25,7 +25,7 @@
     <RootNamespace>WicCodec</RootNamespace>
 
     <!-- Keep in sync with "version" in igplugin.json. -->
-    <Version>1.1.0</Version>
+    <Version>1.2.0</Version>
     <Product>WIC Codec for ImageGlass</Product>
     <Authors>Duong Dieu Phap</Authors>
     <Copyright>Copyright (C) 2026 Duong Dieu Phap</Copyright>
@@ -35,7 +35,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <PackageReference Include="ImageGlass.SDK" Version="1.1.1" />
+    <PackageReference Include="ImageGlass.SDK" Version="1.2.0" />
     <PackageReference Include="Vortice.Win32.Graphics.Imaging" Version="2.5.0" />
   </ItemGroup>
 
