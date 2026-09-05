@@ -136,6 +136,18 @@ internal static unsafe class WicDecode
             Guid sourceFormat;
             if (frame->GetPixelFormat(&sourceFormat).Failure) sourceFormat = default;
             var plan = WicPixels.Choose(factory, sourceFormat);
+            var orientation = ReadOrientation(frame);
+
+            // The HDR files this fork is optimized for are 128bpp RGBA float JXR. WIC's
+            // generic format converter is effectively single-threaded on this path, so decode
+            // the native FP32 raster once and fan the FP32->FP16 conversion across all cores.
+            // This deliberately trades a large temporary buffer for lower wall-clock latency.
+            if (maxWidth == 0 && maxHeight == 0
+                && orientation == 1
+                && sourceFormat == Apis.GUID_WICPixelFormat128bppRGBAFloat)
+            {
+                return DecodeRgbaFloat32FullResolution(frame, outBuf, cancellation);
+            }
 
             // Scale, convert, then rotate. The scaler must sit on the FRAME: it reaches the
             // frame's IWICBitmapSourceTransform there (a JPEG's DCT scales), which the format
@@ -144,7 +156,7 @@ internal static unsafe class WicDecode
             var source = (IWICBitmapSource*)frame;
             if (maxWidth > 0 && maxHeight > 0)
             {
-                var scaled = TryScale(factory, frame, ReadOrientation(frame),
+                var scaled = TryScale(factory, frame, orientation,
                     (uint)maxWidth, (uint)maxHeight, &scaler);
                 if (scaled != null) source = scaled;
             }
@@ -159,7 +171,7 @@ internal static unsafe class WicDecode
 
             if (HostChannel.IsCanceled(cancellation)) return IGStatus.Canceled;
 
-            var transform = ToTransform(ReadOrientation(frame));
+            var transform = ToTransform(orientation);
             if (transform != WICBitmapTransformOptions.Rotate0)
             {
                 if (factory->CreateBitmapFlipRotator(&rotator).Failure) return IGStatus.Internal;
@@ -208,6 +220,97 @@ internal static unsafe class WicDecode
             ComInterop.Release(ref frame);
             ComInterop.Release(ref decoder);
             ComInterop.Release(ref factory);
+        }
+    }
+
+
+    /// <summary>
+    /// Fast path for the 128bpp RGBA-float JPEG XR files used by this fork.
+    /// WIC decodes directly to its native FP32 representation; conversion to the ImageGlass
+    /// RGBA16F ABI buffer is parallelized by row. No reduced-resolution decode is performed.
+    /// </summary>
+    private static IGStatus DecodeRgbaFloat32FullResolution(IWICBitmapFrameDecode* frame,
+        IGPixelBuffer* outBuf, void* cancellation)
+    {
+        uint width = 0, height = 0;
+        if (frame->GetSize(&width, &height).Failure || width == 0 || height == 0)
+        {
+            return IGStatus.DecodeFailed;
+        }
+
+        var srcStride64 = (long)width * 16;
+        var dstStride64 = (long)width * 8;
+        var srcBytes64 = srcStride64 * height;
+        var dstBytes64 = dstStride64 * height;
+        if (srcStride64 > int.MaxValue || dstStride64 > int.MaxValue
+            || srcBytes64 > int.MaxValue || dstBytes64 > int.MaxValue)
+        {
+            return IGStatus.OutOfMemory;
+        }
+
+        byte* sourcePixels = null;
+        byte* destPixels = null;
+        try
+        {
+            sourcePixels = (byte*)NativeMemory.Alloc((nuint)srcBytes64);
+            if (sourcePixels == null) return IGStatus.OutOfMemory;
+
+            if (HostChannel.IsCanceled(cancellation)) return IGStatus.Canceled;
+
+            // CopyPixels is the actual lazy JPEG XR decode. Request the frame's native
+            // 128bpp RGBA-float layout so no WIC format converter sits upstream.
+            if (((IWICBitmapSource*)frame)->CopyPixels(null, (uint)srcStride64,
+                (uint)srcBytes64, sourcePixels).Failure)
+            {
+                return IGStatus.DecodeFailed;
+            }
+
+            if (HostChannel.IsCanceled(cancellation)) return IGStatus.Canceled;
+
+            destPixels = NativeBuffers.AllocPixels((nuint)dstBytes64);
+            if (destPixels == null) return IGStatus.OutOfMemory;
+
+            var srcBase = (nint)sourcePixels;
+            var dstBase = (nint)destPixels;
+            var srcStride = (int)srcStride64;
+            var dstStride = (int)dstStride64;
+            var floatsPerRow = checked((int)width * 4);
+
+            // Parallelize the expensive narrowing pass. The per-row partitioning keeps writes
+            // disjoint and preserves exact RGBA ordering. System.Half uses the platform's
+            // native FP16 conversion where available and a correct software fallback otherwise.
+            var options = new ParallelOptions
+            {
+                MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount),
+            };
+
+            Parallel.For(0, (int)height, options, y =>
+            {
+                var src = (float*)(srcBase + (nint)(y * srcStride));
+                var dst = (Half*)(dstBase + (nint)(y * dstStride));
+
+                for (var x = 0; x < floatsPerRow; x++)
+                {
+                    dst[x] = (Half)src[x];
+                }
+            });
+
+            if (HostChannel.IsCanceled(cancellation)) return IGStatus.Canceled;
+
+            outBuf->Data = destPixels;
+            outBuf->Width = (int)width;
+            outBuf->Height = (int)height;
+            outBuf->Stride = dstStride;
+            outBuf->PixelFormat = (int)IGPixelFormat.RgbaFloat16;
+            outBuf->ReleaseContext = destPixels;
+            destPixels = null; // ownership transferred to the host
+
+            return IGStatus.OK;
+        }
+        finally
+        {
+            NativeMemory.Free(sourcePixels);
+            NativeBuffers.Discard(destPixels);
         }
     }
 
