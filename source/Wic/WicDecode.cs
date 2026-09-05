@@ -567,17 +567,17 @@ internal static unsafe class WicDecode
                         var directBytes64 = (long)(rows - 1) * dstStride + (long)cols * 8;
                         if (directBytes64 > 0 && directBytes64 <= uint.MaxValue)
                         {
-                            var rect = new System.Drawing.Rectangle(x0, y0, cols, rows);
-                            var requestedFormat = Apis.GUID_WICPixelFormat64bppRGBAHalf;
+                            var directRect = new System.Drawing.Rectangle(x0, y0, cols, rows);
+                            var directFormat = Apis.GUID_WICPixelFormat64bppRGBAHalf;
                             var directDest = (byte*)(destBase
                                 + (nint)y0 * dstStride
                                 + (nint)x0 * 8);
-                            var copyStart = copyTicks is null ? 0 : Stopwatch.GetTimestamp();
+                            var directCopyStart = copyTicks is null ? 0 : Stopwatch.GetTimestamp();
                             var directHr = sourceTransform->CopyPixels(
-                                &rect,
+                                &directRect,
                                 width,
                                 height,
-                                &requestedFormat,
+                                &directFormat,
                                 WICBitmapTransformOptions.Rotate0,
                                 (uint)dstStride,
                                 (uint)directBytes64,
@@ -585,11 +585,11 @@ internal static unsafe class WicDecode
 
                             if (copyTicks is not null)
                             {
-                                copyTicks[worker] = Stopwatch.GetTimestamp() - copyStart;
+                                copyTicks[worker] = Stopwatch.GetTimestamp() - directCopyStart;
                             }
 
                             if (directHr.Success
-                                && requestedFormat == Apis.GUID_WICPixelFormat64bppRGBAHalf)
+                                && directFormat == Apis.GUID_WICPixelFormat64bppRGBAHalf)
                             {
                                 if (convertTicks is not null)
                                 {
@@ -627,7 +627,7 @@ internal static unsafe class WicDecode
 
                     if (copyTicks is not null)
                     {
-                        copyTicks[worker] = Stopwatch.GetTimestamp() - copyStart;
+                        copyTicks[worker] = Stopwatch.GetTimestamp() - directCopyStart;
                     }
 
                     if (hr.Failure || requestedFormat != Apis.GUID_WICPixelFormat128bppRGBAFloat)
@@ -795,15 +795,15 @@ internal static unsafe class WicDecode
                         var directBytes64 = (long)dstStride * rows;
                         if (directBytes64 > 0 && directBytes64 <= uint.MaxValue)
                         {
-                            var rect = new System.Drawing.Rectangle(0, y0, (int)width, rows);
-                            var requestedFormat = Apis.GUID_WICPixelFormat64bppRGBAHalf;
+                            var directRect = new System.Drawing.Rectangle(0, y0, (int)width, rows);
+                            var directFormat = Apis.GUID_WICPixelFormat64bppRGBAHalf;
                             var directDest = (byte*)(destBase + (nint)y0 * dstStride);
-                            var copyStart = copyTicks is null ? 0 : Stopwatch.GetTimestamp();
+                            var directCopyStart = copyTicks is null ? 0 : Stopwatch.GetTimestamp();
                             var directHr = sourceTransform->CopyPixels(
-                                &rect,
+                                &directRect,
                                 width,
                                 height,
-                                &requestedFormat,
+                                &directFormat,
                                 WICBitmapTransformOptions.Rotate0,
                                 (uint)dstStride,
                                 (uint)directBytes64,
@@ -811,11 +811,11 @@ internal static unsafe class WicDecode
 
                             if (copyTicks is not null)
                             {
-                                copyTicks[worker] = Stopwatch.GetTimestamp() - copyStart;
+                                copyTicks[worker] = Stopwatch.GetTimestamp() - directCopyStart;
                             }
 
                             if (directHr.Success
-                                && requestedFormat == Apis.GUID_WICPixelFormat64bppRGBAHalf)
+                                && directFormat == Apis.GUID_WICPixelFormat64bppRGBAHalf)
                             {
                                 if (convertTicks is not null) convertTicks[worker] = 0;
                                 if (FastJxrTrace.Enabled)
@@ -856,7 +856,7 @@ internal static unsafe class WicDecode
 
                     if (copyTicks is not null)
                     {
-                        copyTicks[worker] = Stopwatch.GetTimestamp() - copyStart;
+                        copyTicks[worker] = Stopwatch.GetTimestamp() - directCopyStart;
                     }
 
                     if (hr.Failure || requestedFormat != Apis.GUID_WICPixelFormat128bppRGBAFloat)
@@ -1046,7 +1046,7 @@ internal static unsafe class WicDecode
 
                     if (copyTicks is not null)
                     {
-                        copyTicks[worker] = Stopwatch.GetTimestamp() - copyStart;
+                        copyTicks[worker] = Stopwatch.GetTimestamp() - directCopyStart;
                     }
 
                     if (hr.Failure || requestedFormat != Apis.GUID_WICPixelFormat128bppRGBAFloat)
