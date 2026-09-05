@@ -5,6 +5,7 @@ MIT License
 https://github.com/d2phap/wic-imageglass-plugin
 */
 using ImageGlass.SDK.Plugins;
+using System.Runtime.InteropServices;
 using Vortice.Win32;
 using Vortice.Win32.Com;
 using Vortice.Win32.Graphics.Imaging;
