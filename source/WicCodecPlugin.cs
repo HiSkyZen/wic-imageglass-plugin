@@ -311,7 +311,9 @@ internal static unsafe class WicCodecPlugin
 
         _codecApi->LoadMetadata = &CodecLoadMetadata;
         _codecApi->DecodeStaticRaster = &CodecDecodeStaticRaster;
-        _codecApi->DecodeStaticRasterScaled = &CodecDecodeStaticRasterScaled;
+        // Deliberately unsupported: this fork never performs reduced-resolution decoding.
+        // ImageGlass will call DecodeStaticRaster for preview/full-view requests instead.
+        _codecApi->DecodeStaticRasterScaled = null;
         _codecApi->FreePixelBuffer = &CodecFreePixelBuffer;
 
         _codecApi->GetAnimationInfo = null;
