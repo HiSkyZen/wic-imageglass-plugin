@@ -627,7 +627,7 @@ internal static unsafe class WicDecode
 
                     if (copyTicks is not null)
                     {
-                        copyTicks[worker] = Stopwatch.GetTimestamp() - directCopyStart;
+                        copyTicks[worker] = Stopwatch.GetTimestamp() - copyStart;
                     }
 
                     if (hr.Failure || requestedFormat != Apis.GUID_WICPixelFormat128bppRGBAFloat)
@@ -856,7 +856,7 @@ internal static unsafe class WicDecode
 
                     if (copyTicks is not null)
                     {
-                        copyTicks[worker] = Stopwatch.GetTimestamp() - directCopyStart;
+                        copyTicks[worker] = Stopwatch.GetTimestamp() - copyStart;
                     }
 
                     if (hr.Failure || requestedFormat != Apis.GUID_WICPixelFormat128bppRGBAFloat)
@@ -1046,7 +1046,7 @@ internal static unsafe class WicDecode
 
                     if (copyTicks is not null)
                     {
-                        copyTicks[worker] = Stopwatch.GetTimestamp() - directCopyStart;
+                        copyTicks[worker] = Stopwatch.GetTimestamp() - copyStart;
                     }
 
                     if (hr.Failure || requestedFormat != Apis.GUID_WICPixelFormat128bppRGBAFloat)
