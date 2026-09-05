@@ -265,7 +265,19 @@ internal static unsafe class WicDecode
             var exactLayout = JxrTileLayout.TryGet(
                 path, (int)width, (int)height, out var tileLayout) && tileLayout is not null;
 
-            if (partition == "grid")
+            if (partition == "hybrid" && tileLayout?.TileWeights is not null)
+            {
+                var tasks = BuildWeightedHybridTasks(tileLayout, configuredWorkers);
+                actualWorkers = tasks.Length;
+
+                if (actualWorkers > 1)
+                {
+                    parallelStatus = TryDecodeRgbaFloat32Hybrid(
+                        path, frameIndex, width, height, tileLayout, tasks,
+                        outBuf, cancellation);
+                }
+            }
+            else if (partition == "grid")
             {
                 var tileColumns = tileLayout?.Columns ?? (((int)width + 255) / 256);
                 var tileRows = tileLayout?.Rows ?? (((int)height + 255) / 256);
@@ -299,6 +311,20 @@ internal static unsafe class WicDecode
                 }
             }
 
+            if (partition == "hybrid" && parallelStatus == IGStatus.Unsupported)
+            {
+                partition = "strip";
+                var boundaries = tileLayout?.Y ?? BuildFallbackBoundaries((int)height);
+                actualWorkers = Math.Min(configuredWorkers, boundaries.Length - 1);
+
+                if (actualWorkers > 1)
+                {
+                    parallelStatus = TryDecodeRgbaFloat32Regions(
+                        path, frameIndex, width, height, boundaries,
+                        actualWorkers, outBuf, cancellation);
+                }
+            }
+
             if (parallelStatus == IGStatus.OK || parallelStatus == IGStatus.Canceled)
             {
                 if (FastJxrTrace.Enabled)
@@ -318,6 +344,312 @@ internal static unsafe class WicDecode
             FastJxrTrace.Info($"sequential RGBA32F path size={width}x{height}");
         }
         return DecodeRgbaFloat32Sequential(frame, width, height, outBuf, cancellation);
+    }
+
+
+    private readonly struct RoiTask
+    {
+        public RoiTask(int columnStart, int columnEnd, int row, ulong weight)
+        {
+            ColumnStart = columnStart;
+            ColumnEnd = columnEnd;
+            Row = row;
+            Weight = weight;
+        }
+
+        public int ColumnStart { get; }
+        public int ColumnEnd { get; }
+        public int Row { get; }
+        public ulong Weight { get; }
+    }
+
+
+    /// <summary>
+    /// Starts with one full-width task per physical JPEG XR tile row. If the machine has spare
+    /// logical processors, the heaviest rows are split horizontally using the codestream index
+    /// table as the cost estimate. Every resulting worker still performs exactly one CopyPixels
+    /// call, avoiding the repeated ROI setup cost that made the grid scheduler slow.
+    /// </summary>
+    private static RoiTask[] BuildWeightedHybridTasks(JxrTileLayout layout, int requestedWorkers)
+    {
+        var weights = layout.TileWeights;
+        if (weights is null || layout.Rows <= 0 || layout.Columns <= 0)
+        {
+            return [];
+        }
+
+        var rows = layout.Rows;
+        var columns = layout.Columns;
+        var target = Math.Min(Math.Max(1, requestedWorkers), checked(rows * columns));
+        var tasks = new List<RoiTask>(Math.Max(rows, target));
+
+        for (var row = 0; row < rows; row++)
+        {
+            ulong weight = 0;
+            var baseIndex = checked(row * columns);
+            for (var column = 0; column < columns; column++)
+            {
+                weight += weights[baseIndex + column];
+            }
+
+            tasks.Add(new RoiTask(0, columns, row, weight));
+        }
+
+        while (tasks.Count < target)
+        {
+            var splitTask = -1;
+            ulong heaviest = 0;
+
+            for (var i = 0; i < tasks.Count; i++)
+            {
+                var task = tasks[i];
+                if (task.ColumnEnd - task.ColumnStart <= 1) continue;
+                if (splitTask >= 0 && task.Weight <= heaviest) continue;
+
+                splitTask = i;
+                heaviest = task.Weight;
+            }
+
+            if (splitTask < 0) break;
+
+            var original = tasks[splitTask];
+            var baseIndex = checked(original.Row * columns);
+
+            ulong total = 0;
+            for (var column = original.ColumnStart; column < original.ColumnEnd; column++)
+            {
+                total += weights[baseIndex + column];
+            }
+
+            var bestColumn = original.ColumnStart + 1;
+            ulong bestLeft = 0;
+            ulong left = 0;
+            ulong bestDelta = ulong.MaxValue;
+
+            for (var column = original.ColumnStart; column < original.ColumnEnd - 1; column++)
+            {
+                left += weights[baseIndex + column];
+                var right = total - left;
+                var delta = left >= right ? left - right : right - left;
+
+                if (delta >= bestDelta) continue;
+                bestDelta = delta;
+                bestColumn = column + 1;
+                bestLeft = left;
+            }
+
+            if (bestLeft == 0)
+            {
+                bestLeft = 0;
+                for (var column = original.ColumnStart; column < bestColumn; column++)
+                {
+                    bestLeft += weights[baseIndex + column];
+                }
+            }
+
+            var rightWeight = total - bestLeft;
+            tasks[splitTask] = new RoiTask(
+                original.ColumnStart, bestColumn, original.Row, bestLeft);
+            tasks.Add(new RoiTask(
+                bestColumn, original.ColumnEnd, original.Row, rightWeight));
+        }
+
+        return [.. tasks];
+    }
+
+
+    private static IGStatus TryDecodeRgbaFloat32Hybrid(string path, int frameIndex,
+        uint width, uint height, JxrTileLayout layout, RoiTask[] tasks,
+        IGPixelBuffer* outBuf, void* cancellation)
+    {
+        var dstStride64 = (long)width * 8;
+        var dstBytes64 = dstStride64 * height;
+        if (dstStride64 <= 0 || dstStride64 > int.MaxValue || dstBytes64 > int.MaxValue)
+        {
+            return IGStatus.OutOfMemory;
+        }
+
+        byte* destPixels = null;
+        try
+        {
+            destPixels = NativeBuffers.AllocPixels((nuint)dstBytes64);
+            if (destPixels == null) return IGStatus.OutOfMemory;
+
+            var workers = tasks.Length;
+            var destBase = (nint)destPixels;
+            var cancellationPtr = (nint)cancellation;
+            var dstStride = (int)dstStride64;
+            var failed = 0;
+            var canceled = 0;
+            var setupTicks = FastJxrTrace.Enabled ? new long[workers] : null;
+            var copyTicks = FastJxrTrace.Enabled ? new long[workers] : null;
+            var convertTicks = FastJxrTrace.Enabled ? new long[workers] : null;
+
+            var options = new ParallelOptions { MaxDegreeOfParallelism = workers };
+            Parallel.For(0, workers, options, worker =>
+            {
+                if (Volatile.Read(ref failed) != 0 || Volatile.Read(ref canceled) != 0) return;
+                if (HostChannel.IsCanceled((void*)cancellationPtr))
+                {
+                    Interlocked.Exchange(ref canceled, 1);
+                    return;
+                }
+
+                var task = tasks[worker];
+                var x0 = layout.X[task.ColumnStart];
+                var x1 = layout.X[task.ColumnEnd];
+                var y0 = layout.Y[task.Row];
+                var y1 = layout.Y[task.Row + 1];
+                var cols = x1 - x0;
+                var rows = y1 - y0;
+                if (cols <= 0 || rows <= 0)
+                {
+                    Interlocked.CompareExchange(ref failed, (int)IGStatus.Internal, 0);
+                    return;
+                }
+
+                var srcStride64 = (long)cols * 16;
+                var sourceBytes64 = srcStride64 * rows;
+                if (srcStride64 <= 0 || srcStride64 > uint.MaxValue
+                    || sourceBytes64 <= 0 || sourceBytes64 > uint.MaxValue)
+                {
+                    Interlocked.CompareExchange(ref failed, (int)IGStatus.OutOfMemory, 0);
+                    return;
+                }
+
+                var srcStride = (uint)srcStride64;
+                var floatsPerRow = checked(cols * 4);
+
+                IWICImagingFactory* workerFactory = null;
+                IWICBitmapDecoder* workerDecoder = null;
+                IWICBitmapFrameDecode* workerFrame = null;
+                IWICBitmapSourceTransform* sourceTransform = null;
+                byte* sourcePixels = null;
+
+                try
+                {
+                    var setupStart = setupTicks is null ? 0 : Stopwatch.GetTimestamp();
+                    var openStatus = Open(path, (void*)cancellationPtr, ref workerFactory, ref workerDecoder);
+                    if (openStatus != IGStatus.OK)
+                    {
+                        Interlocked.CompareExchange(ref failed, (int)openStatus, 0);
+                        return;
+                    }
+
+                    if (workerDecoder->GetFrame((uint)frameIndex, &workerFrame).Failure)
+                    {
+                        Interlocked.CompareExchange(ref failed, (int)IGStatus.DecodeFailed, 0);
+                        return;
+                    }
+
+                    Guid sourceFormat;
+                    if (workerFrame->GetPixelFormat(&sourceFormat).Failure
+                        || sourceFormat != Apis.GUID_WICPixelFormat128bppRGBAFloat)
+                    {
+                        Interlocked.CompareExchange(ref failed, (int)IGStatus.Unsupported, 0);
+                        return;
+                    }
+
+                    var transformIid = IWICBitmapSourceTransform.IID_IWICBitmapSourceTransform;
+                    if (workerFrame->QueryInterface(&transformIid, (void**)&sourceTransform).Failure)
+                    {
+                        Interlocked.CompareExchange(ref failed, (int)IGStatus.Unsupported, 0);
+                        return;
+                    }
+
+                    if (setupTicks is not null)
+                    {
+                        setupTicks[worker] = Stopwatch.GetTimestamp() - setupStart;
+                    }
+
+                    sourcePixels = (byte*)NativeMemory.Alloc((nuint)sourceBytes64);
+                    if (sourcePixels == null)
+                    {
+                        Interlocked.CompareExchange(ref failed, (int)IGStatus.OutOfMemory, 0);
+                        return;
+                    }
+
+                    var rect = new System.Drawing.Rectangle(x0, y0, cols, rows);
+                    var requestedFormat = Apis.GUID_WICPixelFormat128bppRGBAFloat;
+                    var copyStart = copyTicks is null ? 0 : Stopwatch.GetTimestamp();
+                    var hr = sourceTransform->CopyPixels(
+                        &rect,
+                        width,
+                        height,
+                        &requestedFormat,
+                        WICBitmapTransformOptions.Rotate0,
+                        srcStride,
+                        (uint)sourceBytes64,
+                        sourcePixels);
+
+                    if (copyTicks is not null)
+                    {
+                        copyTicks[worker] = Stopwatch.GetTimestamp() - copyStart;
+                    }
+
+                    if (hr.Failure || requestedFormat != Apis.GUID_WICPixelFormat128bppRGBAFloat)
+                    {
+                        Interlocked.CompareExchange(ref failed, (int)IGStatus.DecodeFailed, 0);
+                        return;
+                    }
+
+                    var convertStart = convertTicks is null ? 0 : Stopwatch.GetTimestamp();
+                    for (var row = 0; row < rows; row++)
+                    {
+                        var src = (float*)(sourcePixels + (nint)row * srcStride);
+                        var dst = (Half*)(destBase
+                            + (nint)(y0 + row) * dstStride
+                            + (nint)x0 * 8);
+
+                        TensorPrimitives.ConvertToHalf(
+                            new ReadOnlySpan<float>(src, floatsPerRow),
+                            new Span<Half>(dst, floatsPerRow));
+                    }
+
+                    if (convertTicks is not null)
+                    {
+                        convertTicks[worker] = Stopwatch.GetTimestamp() - convertStart;
+                        FastJxrTrace.Info(
+                            $"worker-stage mode=hybrid, worker={worker}, row={task.Row}, " +
+                            $"columns={task.ColumnStart}-{task.ColumnEnd}, weight={task.Weight}, " +
+                            $"setup={setupTicks![worker] * 1000.0 / Stopwatch.Frequency:F3}, " +
+                            $"copy={copyTicks![worker] * 1000.0 / Stopwatch.Frequency:F3}, " +
+                            $"convert={convertTicks[worker] * 1000.0 / Stopwatch.Frequency:F3}");
+                    }
+                }
+                catch
+                {
+                    Interlocked.CompareExchange(ref failed, (int)IGStatus.Internal, 0);
+                }
+                finally
+                {
+                    NativeMemory.Free(sourcePixels);
+                    ComInterop.Release(ref sourceTransform);
+                    ComInterop.Release(ref workerFrame);
+                    ComInterop.Release(ref workerDecoder);
+                    ComInterop.Release(ref workerFactory);
+                }
+            });
+
+            TraceParallelStages("hybrid", setupTicks, copyTicks, convertTicks);
+
+            if (Volatile.Read(ref canceled) != 0) return IGStatus.Canceled;
+            var failure = Volatile.Read(ref failed);
+            if (failure != 0) return (IGStatus)failure;
+
+            outBuf->Data = destPixels;
+            outBuf->Width = (int)width;
+            outBuf->Height = (int)height;
+            outBuf->Stride = dstStride;
+            outBuf->PixelFormat = (int)IGPixelFormat.RgbaFloat16;
+            outBuf->ReleaseContext = destPixels;
+            destPixels = null;
+            return IGStatus.OK;
+        }
+        finally
+        {
+            NativeBuffers.Discard(destPixels);
+        }
     }
 
 
@@ -1018,6 +1350,7 @@ internal static unsafe class WicDecode
     private static string GetPartitionMode()
     {
         var mode = Environment.GetEnvironmentVariable("FASTJXR_PARTITION");
+        if (string.Equals(mode, "hybrid", StringComparison.OrdinalIgnoreCase)) return "hybrid";
         if (string.Equals(mode, "grid", StringComparison.OrdinalIgnoreCase)) return "grid";
         if (string.Equals(mode, "column", StringComparison.OrdinalIgnoreCase)) return "column";
         return "strip";
