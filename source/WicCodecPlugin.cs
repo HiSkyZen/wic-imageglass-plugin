@@ -26,7 +26,9 @@ internal static unsafe class WicCodecPlugin
     // Above SkiaSharp (100) and Magick.NET (10/100) for every extension WIC claims. Enabling a
     // plugin is an explicit act of trust, so the host honors this verbatim; the per-extension
     // tick boxes in Settings > Plugins are how a user hands an individual format back.
-    private const int Priority = 300;
+    // Intentionally outrank the upstream general-purpose WIC plugin (300) for JXR extensions.
+    // This lets both plugins remain installed while Fast JXR owns .jxr/.wdp/.hdp.
+    private const int Priority = 1000;
 
     // IGHdrTransferFn.ScRgb arrived in ABI minor 1; an older host maps the unknown value to None
     // and skips tone mapping entirely, which blows out every extended-range image.
