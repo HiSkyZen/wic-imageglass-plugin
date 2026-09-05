@@ -162,7 +162,7 @@ internal static unsafe class WicDecode
                 && orientation == 1
                 && sourceFormat == Apis.GUID_WICPixelFormat128bppRGBAFloat)
             {
-                return DecodeRgbaFloat32FullResolution(frame, outBuf, cancellation);
+                return DecodeRgbaFloat32FullResolution(path, frameIndex, frame, outBuf, cancellation);
             }
 
             var plan = WicPixels.Choose(factory, sourceFormat);
@@ -243,12 +243,13 @@ internal static unsafe class WicDecode
 
 
     /// <summary>
-    /// Fast path for the 128bpp RGBA-float JPEG XR files used by this fork.
-    /// WIC decodes directly to its native FP32 representation; conversion to the ImageGlass
-    /// RGBA16F ABI buffer is parallelized by row. No reduced-resolution decode is performed.
+    /// Fast path for 128bpp RGBA-float JPEG XR. It first attempts parallel ROI decoding with
+    /// independent WIC decoder instances. JPEG XR tiles make those full-resolution regions
+    /// independently decodable; if the installed codec rejects the strategy, the proven
+    /// single-decoder path is used immediately.
     /// </summary>
-    private static IGStatus DecodeRgbaFloat32FullResolution(IWICBitmapFrameDecode* frame,
-        IGPixelBuffer* outBuf, void* cancellation)
+    private static IGStatus DecodeRgbaFloat32FullResolution(string path, int frameIndex,
+        IWICBitmapFrameDecode* frame, IGPixelBuffer* outBuf, void* cancellation)
     {
         uint width = 0, height = 0;
         if (frame->GetSize(&width, &height).Failure || width == 0 || height == 0)
@@ -256,6 +257,196 @@ internal static unsafe class WicDecode
             return IGStatus.DecodeFailed;
         }
 
+        var workers = GetRegionWorkerCount((int)height);
+        if (workers > 1)
+        {
+            var parallelStatus = TryDecodeRgbaFloat32Regions(
+                path, frameIndex, width, height, workers, outBuf, cancellation);
+
+            if (parallelStatus == IGStatus.OK || parallelStatus == IGStatus.Canceled)
+            {
+                return parallelStatus;
+            }
+
+            HostChannel.Log(3, $"FastJXR: parallel ROI decode fell back to single decoder ({parallelStatus}).");
+        }
+
+        return DecodeRgbaFloat32Sequential(frame, width, height, outBuf, cancellation);
+    }
+
+
+    /// <summary>
+    /// Decodes independent full-resolution horizontal regions concurrently. There is no image
+    /// scaling: uiWidth/uiHeight always remain the source dimensions, and only the ROI changes.
+    /// </summary>
+    private static IGStatus TryDecodeRgbaFloat32Regions(string path, int frameIndex,
+        uint width, uint height, int workers, IGPixelBuffer* outBuf, void* cancellation)
+    {
+        var srcStride64 = (long)width * 16;
+        var dstStride64 = (long)width * 8;
+        var dstBytes64 = dstStride64 * height;
+        if (srcStride64 <= 0 || dstStride64 <= 0 || srcStride64 > uint.MaxValue
+            || dstStride64 > int.MaxValue || dstBytes64 > int.MaxValue)
+        {
+            return IGStatus.OutOfMemory;
+        }
+
+        byte* destPixels = null;
+        try
+        {
+            destPixels = NativeBuffers.AllocPixels((nuint)dstBytes64);
+            if (destPixels == null) return IGStatus.OutOfMemory;
+
+            var destBase = (nint)destPixels;
+            var cancellationPtr = (nint)cancellation;
+            var dstStride = (int)dstStride64;
+            var srcStride = (uint)srcStride64;
+            var floatsPerRow = checked((int)width * 4);
+            var totalTileRows = ((int)height + 255) / 256;
+            var failed = 0;
+            var canceled = 0;
+
+            var options = new ParallelOptions { MaxDegreeOfParallelism = workers };
+            Parallel.For(0, workers, options, worker =>
+            {
+                if (Volatile.Read(ref failed) != 0 || Volatile.Read(ref canceled) != 0) return;
+                if (HostChannel.IsCanceled((void*)cancellationPtr))
+                {
+                    Interlocked.Exchange(ref canceled, 1);
+                    return;
+                }
+
+                var tileRowStart = totalTileRows * worker / workers;
+                var tileRowEnd = totalTileRows * (worker + 1) / workers;
+                var y0 = tileRowStart * 256;
+                var y1 = Math.Min((int)height, tileRowEnd * 256);
+                var rows = y1 - y0;
+                if (rows <= 0) return;
+
+                IWICImagingFactory* workerFactory = null;
+                IWICBitmapDecoder* workerDecoder = null;
+                IWICBitmapFrameDecode* workerFrame = null;
+                IWICBitmapSourceTransform* sourceTransform = null;
+                byte* sourcePixels = null;
+
+                try
+                {
+                    var openStatus = Open(path, (void*)cancellationPtr, ref workerFactory, ref workerDecoder);
+                    if (openStatus != IGStatus.OK)
+                    {
+                        Interlocked.CompareExchange(ref failed, (int)openStatus, 0);
+                        return;
+                    }
+
+                    if (workerDecoder->GetFrame((uint)frameIndex, &workerFrame).Failure)
+                    {
+                        Interlocked.CompareExchange(ref failed, (int)IGStatus.DecodeFailed, 0);
+                        return;
+                    }
+
+                    Guid sourceFormat;
+                    if (workerFrame->GetPixelFormat(&sourceFormat).Failure
+                        || sourceFormat != Apis.GUID_WICPixelFormat128bppRGBAFloat)
+                    {
+                        Interlocked.CompareExchange(ref failed, (int)IGStatus.Unsupported, 0);
+                        return;
+                    }
+
+                    var transformIid = IWICBitmapSourceTransform.IID_IWICBitmapSourceTransform;
+                    if (workerFrame->QueryInterface(&transformIid, (void**)&sourceTransform).Failure)
+                    {
+                        Interlocked.CompareExchange(ref failed, (int)IGStatus.Unsupported, 0);
+                        return;
+                    }
+
+                    var sourceBytes64 = (long)srcStride * rows;
+                    if (sourceBytes64 <= 0 || sourceBytes64 > uint.MaxValue)
+                    {
+                        Interlocked.CompareExchange(ref failed, (int)IGStatus.OutOfMemory, 0);
+                        return;
+                    }
+
+                    sourcePixels = (byte*)NativeMemory.Alloc((nuint)sourceBytes64);
+                    if (sourcePixels == null)
+                    {
+                        Interlocked.CompareExchange(ref failed, (int)IGStatus.OutOfMemory, 0);
+                        return;
+                    }
+
+                    var rect = new System.Drawing.Rectangle(0, y0, (int)width, rows);
+                    var requestedFormat = Apis.GUID_WICPixelFormat128bppRGBAFloat;
+                    var hr = sourceTransform->CopyPixels(
+                        &rect,
+                        width,
+                        height,
+                        &requestedFormat,
+                        WICBitmapTransformOptions.Rotate0,
+                        srcStride,
+                        (uint)sourceBytes64,
+                        sourcePixels);
+
+                    if (hr.Failure || requestedFormat != Apis.GUID_WICPixelFormat128bppRGBAFloat)
+                    {
+                        Interlocked.CompareExchange(ref failed, (int)IGStatus.DecodeFailed, 0);
+                        return;
+                    }
+
+                    for (var row = 0; row < rows; row++)
+                    {
+                        if ((row & 31) == 0 && HostChannel.IsCanceled((void*)cancellationPtr))
+                        {
+                            Interlocked.Exchange(ref canceled, 1);
+                            return;
+                        }
+
+                        var src = (float*)(sourcePixels + (nint)row * srcStride);
+                        var dst = (Half*)(destBase + (nint)(y0 + row) * dstStride);
+                        TensorPrimitives.ConvertToHalf(
+                            new ReadOnlySpan<float>(src, floatsPerRow),
+                            new Span<Half>(dst, floatsPerRow));
+                    }
+                }
+                catch
+                {
+                    Interlocked.CompareExchange(ref failed, (int)IGStatus.Internal, 0);
+                }
+                finally
+                {
+                    NativeMemory.Free(sourcePixels);
+                    ComInterop.Release(ref sourceTransform);
+                    ComInterop.Release(ref workerFrame);
+                    ComInterop.Release(ref workerDecoder);
+                    ComInterop.Release(ref workerFactory);
+                }
+            });
+
+            if (Volatile.Read(ref canceled) != 0) return IGStatus.Canceled;
+            var failure = Volatile.Read(ref failed);
+            if (failure != 0) return (IGStatus)failure;
+
+            outBuf->Data = destPixels;
+            outBuf->Width = (int)width;
+            outBuf->Height = (int)height;
+            outBuf->Stride = dstStride;
+            outBuf->PixelFormat = (int)IGPixelFormat.RgbaFloat16;
+            outBuf->ReleaseContext = destPixels;
+            destPixels = null;
+            return IGStatus.OK;
+        }
+        finally
+        {
+            NativeBuffers.Discard(destPixels);
+        }
+    }
+
+
+    /// <summary>
+    /// Conservative single-decoder full-resolution fallback. WIC emits native RGBA32F once and
+    /// the narrowing pass is then vectorized and spread across all logical processors.
+    /// </summary>
+    private static IGStatus DecodeRgbaFloat32Sequential(IWICBitmapFrameDecode* frame,
+        uint width, uint height, IGPixelBuffer* outBuf, void* cancellation)
+    {
         var srcStride64 = (long)width * 16;
         var dstStride64 = (long)width * 8;
         var srcBytes64 = srcStride64 * height;
@@ -275,8 +466,6 @@ internal static unsafe class WicDecode
 
             if (HostChannel.IsCanceled(cancellation)) return IGStatus.Canceled;
 
-            // CopyPixels is the actual lazy JPEG XR decode. Request the frame's native
-            // 128bpp RGBA-float layout so no WIC format converter sits upstream.
             if (((IWICBitmapSource*)frame)->CopyPixels(null, (uint)srcStride64,
                 (uint)srcBytes64, sourcePixels).Failure)
             {
@@ -294,9 +483,6 @@ internal static unsafe class WicDecode
             var dstStride = (int)dstStride64;
             var floatsPerRow = checked((int)width * 4);
 
-            // Parallelize the expensive narrowing pass. The per-row partitioning keeps writes
-            // disjoint and preserves exact RGBA ordering. System.Half uses the platform's
-            // native FP16 conversion where available and a correct software fallback otherwise.
             var options = new ParallelOptions
             {
                 MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount),
@@ -306,7 +492,6 @@ internal static unsafe class WicDecode
             {
                 var src = (float*)(srcBase + (nint)(y * srcStride));
                 var dst = (Half*)(dstBase + (nint)(y * dstStride));
-
                 TensorPrimitives.ConvertToHalf(
                     new ReadOnlySpan<float>(src, floatsPerRow),
                     new Span<Half>(dst, floatsPerRow));
@@ -320,8 +505,7 @@ internal static unsafe class WicDecode
             outBuf->Stride = dstStride;
             outBuf->PixelFormat = (int)IGPixelFormat.RgbaFloat16;
             outBuf->ReleaseContext = destPixels;
-            destPixels = null; // ownership transferred to the host
-
+            destPixels = null;
             return IGStatus.OK;
         }
         finally
@@ -329,6 +513,22 @@ internal static unsafe class WicDecode
             NativeMemory.Free(sourcePixels);
             NativeBuffers.Discard(destPixels);
         }
+    }
+
+
+    private static int GetRegionWorkerCount(int height)
+    {
+        var tileRows = Math.Max(1, (height + 255) / 256);
+        var defaultWorkers = Math.Clamp(Environment.ProcessorCount / 2, 1, 8);
+
+        var configured = defaultWorkers;
+        var text = Environment.GetEnvironmentVariable("FASTJXR_WORKERS");
+        if (int.TryParse(text, out var parsed))
+        {
+            configured = Math.Clamp(parsed, 1, 16);
+        }
+
+        return Math.Min(configured, tileRows);
     }
 
 
