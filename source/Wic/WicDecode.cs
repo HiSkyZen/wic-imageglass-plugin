@@ -93,7 +93,22 @@ internal static unsafe class WicDecode
     /// Decodes one frame at full size into a freshly allocated native buffer owned by the host.
     /// </summary>
     public static IGStatus Decode(string path, int frameIndex, IGPixelBuffer* outBuf, void* cancellation)
-        => DecodeCore(path, frameIndex, 0, 0, outBuf, cancellation);
+    {
+        // ImageGlass can ask the codec for the same still more than once while transitioning
+        // from metadata/preview to the final view. Full-resolution decoding is expensive, so a
+        // short-lived native cache turns duplicate requests into a single memory copy.
+        if (frameIndex == 0 && JxrDecodeCache.TryCopyToHost(path, outBuf))
+        {
+            return IGStatus.OK;
+        }
+
+        var status = DecodeCore(path, frameIndex, 0, 0, outBuf, cancellation);
+        if (status == IGStatus.OK && frameIndex == 0)
+        {
+            JxrDecodeCache.Store(path, outBuf);
+        }
+        return status;
+    }
 
 
     /// <summary>
