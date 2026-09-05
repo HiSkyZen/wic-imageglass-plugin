@@ -171,12 +171,28 @@ function Parse-TraceFile {
         }
     }
 
+    $setupMaxMs = [double]::NaN
+    $copyMaxMs = [double]::NaN
+    $convertMaxMs = [double]::NaN
+
+    foreach ($line in $lines) {
+        if ($line -match '\tevent=info\tmessage=stages mode=(strip|column), setup-mean=([0-9.]+), setup-max=([0-9.]+), copy-mean=([0-9.]+), copy-max=([0-9.]+), convert-mean=([0-9.]+), convert-max=([0-9.]+)') {
+            $setupMaxMs = [double]::Parse($matches[3], [Globalization.CultureInfo]::InvariantCulture)
+            $copyMaxMs = [double]::Parse($matches[5], [Globalization.CultureInfo]::InvariantCulture)
+            $convertMaxMs = [double]::Parse($matches[7], [Globalization.CultureInfo]::InvariantCulture)
+            break
+        }
+    }
+
     return [pscustomobject]@{
         Status        = $timing.Status
         DecodeMs      = $timing.DecodeMs
         Route         = $route
         Partition     = $partition
         ActualWorkers = $actualWorkers
+        SetupMaxMs    = $setupMaxMs
+        CopyMaxMs     = $copyMaxMs
+        ConvertMaxMs  = $convertMaxMs
     }
 }
 
@@ -240,6 +256,9 @@ function Invoke-FastJxrTrial {
                 ActualWorkers = $parsed.ActualWorkers
                 Repeat        = $Repeat
                 DecodeMs      = [math]::Round($parsed.DecodeMs, 3)
+                SetupMaxMs    = $parsed.SetupMaxMs
+                CopyMaxMs     = $parsed.CopyMaxMs
+                ConvertMaxMs  = $parsed.ConvertMaxMs
                 Route         = $parsed.Route
                 Status        = $parsed.Status
                 WallMs        = [math]::Round($wall.Elapsed.TotalMilliseconds, 1)
@@ -353,7 +372,12 @@ try {
                         -Warmup $false
 
                     $results.Add($result)
-                    Write-Host (" {0,8:N1} ms  actual={1,2}  {2}" -f $result.DecodeMs, $result.ActualWorkers, $result.Route) -ForegroundColor Green
+                    $stageText = if (-not [double]::IsNaN([double]$result.CopyMaxMs)) {
+                        " copyMax={0:N1} convMax={1:N1}" -f $result.CopyMaxMs, $result.ConvertMaxMs
+                    }
+                    else { "" }
+
+                    Write-Host (" {0,8:N1} ms  actual={1,2}  {2}{3}" -f $result.DecodeMs, $result.ActualWorkers, $result.Route, $stageText) -ForegroundColor Green
                 }
                 catch {
                     $failure = [pscustomobject]@{
@@ -362,6 +386,9 @@ try {
                         ActualWorkers = 0
                         Repeat        = $repeat
                         DecodeMs      = [double]::NaN
+                        SetupMaxMs    = [double]::NaN
+                        CopyMaxMs     = [double]::NaN
+                        ConvertMaxMs  = [double]::NaN
                         Route         = 'failed'
                         Status        = 'FAILED'
                         WallMs        = [double]::NaN
@@ -403,11 +430,14 @@ $summary = foreach ($partition in $Partitions) {
                 Worker        = $worker
                 ActualWorkers = 0
                 Runs          = 0
-                MedianMs      = [double]::NaN
-                MeanMs        = [double]::NaN
-                BestMs        = [double]::NaN
-                WorstMs       = [double]::NaN
-                Route         = 'failed'
+                MedianMs         = [double]::NaN
+                MeanMs           = [double]::NaN
+                BestMs           = [double]::NaN
+                WorstMs          = [double]::NaN
+                SetupMaxMedianMs = [double]::NaN
+                CopyMaxMedianMs  = [double]::NaN
+                ConvertMaxMedianMs = [double]::NaN
+                Route            = 'failed'
             }
             continue
         }
@@ -417,16 +447,23 @@ $summary = foreach ($partition in $Partitions) {
         $route = (($valid | Group-Object Route | Sort-Object Count -Descending | Select-Object -First 1).Name)
         $actualWorkers = (($valid | Group-Object ActualWorkers | Sort-Object Count -Descending | Select-Object -First 1).Name)
 
+        $setupValues = [double[]]@($valid | Where-Object { -not [double]::IsNaN([double]$_.SetupMaxMs) } | ForEach-Object { [double]$_.SetupMaxMs })
+        $copyValues = [double[]]@($valid | Where-Object { -not [double]::IsNaN([double]$_.CopyMaxMs) } | ForEach-Object { [double]$_.CopyMaxMs })
+        $convertValues = [double[]]@($valid | Where-Object { -not [double]::IsNaN([double]$_.ConvertMaxMs) } | ForEach-Object { [double]$_.ConvertMaxMs })
+
         [pscustomobject]@{
             Partition     = $partition
             Worker        = $worker
             ActualWorkers = [int]$actualWorkers
             Runs          = $valid.Count
-            MedianMs      = [math]::Round((Get-Median $values), 3)
-            MeanMs        = [math]::Round([double]$measure.Average, 3)
-            BestMs        = [math]::Round([double]$measure.Minimum, 3)
-            WorstMs       = [math]::Round([double]$measure.Maximum, 3)
-            Route         = $route
+            MedianMs         = [math]::Round((Get-Median $values), 3)
+            MeanMs           = [math]::Round([double]$measure.Average, 3)
+            BestMs           = [math]::Round([double]$measure.Minimum, 3)
+            WorstMs          = [math]::Round([double]$measure.Maximum, 3)
+            SetupMaxMedianMs = if ($setupValues.Count) { [math]::Round((Get-Median $setupValues), 3) } else { [double]::NaN }
+            CopyMaxMedianMs  = if ($copyValues.Count) { [math]::Round((Get-Median $copyValues), 3) } else { [double]::NaN }
+            ConvertMaxMedianMs = if ($convertValues.Count) { [math]::Round((Get-Median $convertValues), 3) } else { [double]::NaN }
+            Route            = $route
         }
     }
 }
@@ -462,7 +499,7 @@ $summary |
         if ([double]::IsNaN([double]$_.MedianMs)) { [double]::PositiveInfinity }
         else { [double]$_.MedianMs }
     }} |
-    Format-Table Partition, Worker, ActualWorkers, Runs, MedianMs, MeanMs, BestMs, WorstMs, RelativeToBest, Route -AutoSize
+    Format-Table Partition, Worker, ActualWorkers, Runs, MedianMs, SetupMaxMedianMs, CopyMaxMedianMs, ConvertMaxMedianMs, RelativeToBest, Route -AutoSize
 
 if ($validSummary.Count -gt 0) {
     $winner = $validSummary | Sort-Object MedianMs | Select-Object -First 1
