@@ -166,31 +166,6 @@ internal static unsafe class WicCodecPlugin
 
 
     [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
-    private static IGStatus CodecDecodeStaticRasterScaled(IGStringRef filePath, int frameIndex,
-        int maxWidth, int maxHeight, IGPixelBuffer* outBuf, void* cancellation)
-    {
-        if (outBuf == null) return IGStatus.InvalidArg;
-        *outBuf = default;
-
-        try
-        {
-            if (!TryGetPath(filePath, out var path)) return IGStatus.InvalidArg;
-            // Full-resolution is intentional: this fork never asks WIC/JPEG XR for a reduced-resolution decode.
-            return WicDecode.Decode(path, frameIndex, outBuf, cancellation);
-        }
-        catch (OutOfMemoryException)
-        {
-            return IGStatus.OutOfMemory;
-        }
-        catch (Exception ex)
-        {
-            HostChannel.Log(4, $"WicCodec: DecodeStaticRasterScaled failed. {ex}");
-            return IGStatus.Internal;
-        }
-    }
-
-
-    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
     private static void CodecFreePixelBuffer(IGPixelBuffer* buf)
     {
         if (buf == null || buf->Data == null) return;
@@ -205,71 +180,6 @@ internal static unsafe class WicCodecPlugin
             buf->ReleaseContext = null;
         }
         catch { }
-    }
-
-
-    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
-    private static IGStatus CodecEncodeStaticRaster(IGStringRef destFilePath, IGPixelBuffer* pixels,
-        IGEncodeOptions* options, void* cancellation)
-    {
-        try
-        {
-            if (!TryGetPath(destFilePath, out var path)) return IGStatus.InvalidArg;
-            return WicEncode.EncodeStatic(path, pixels, options, cancellation);
-        }
-        catch (Exception ex)
-        {
-            HostChannel.Log(4, $"WicCodec: EncodeStaticRaster failed. {ex}");
-            return IGStatus.Internal;
-        }
-    }
-
-
-    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
-    private static IGStatus CodecBeginEncodeMultiFrame(IGStringRef destFilePath,
-        IGMultiFrameEncodeInfo* info, IGEncodeOptions* options, void** outSession, void* cancellation)
-    {
-        try
-        {
-            if (!TryGetPath(destFilePath, out var path)) return IGStatus.InvalidArg;
-            return WicEncode.BeginMultiFrame(path, info, options, outSession, cancellation);
-        }
-        catch (Exception ex)
-        {
-            HostChannel.Log(4, $"WicCodec: BeginEncodeMultiFrame failed. {ex}");
-            return IGStatus.Internal;
-        }
-    }
-
-
-    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
-    private static IGStatus CodecEncodeFrame(void* session, IGPixelBuffer* frame,
-        IGEncodeFrameInfo* frameInfo, void* cancellation)
-    {
-        try
-        {
-            return WicEncode.EncodeFrame(session, frame, frameInfo, cancellation);
-        }
-        catch (Exception ex)
-        {
-            HostChannel.Log(4, $"WicCodec: EncodeFrame failed. {ex}");
-            return IGStatus.Internal;
-        }
-    }
-
-
-    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
-    private static IGStatus CodecEndEncodeMultiFrame(void* session, int commit, void* cancellation)
-    {
-        try
-        {
-            return WicEncode.EndMultiFrame(session, commit, cancellation);
-        }
-        catch (Exception ex)
-        {
-            HostChannel.Log(4, $"WicCodec: EndEncodeMultiFrame failed. {ex}");
-            return IGStatus.Internal;
-        }
     }
 
 
