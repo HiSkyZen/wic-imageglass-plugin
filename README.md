@@ -22,14 +22,16 @@ more aggressive JPEG XR decode path.
 For the 128bpp RGBA-float HDR files this fork targets:
 
 1. Open the WIC JPEG XR/WMP decoder directly instead of performing generic codec discovery.
-2. Request native `128bpp RGBA Float` pixels, bypassing WIC's generic FP32 -> FP16 converter.
-3. Attempt **parallel full-resolution ROI decoding** with independent WIC decoder instances.
-   JPEG XR's tiled representation allows regions to be decoded independently.
-4. Convert each decoded region from FP32 to ImageGlass `RGBA16F` with
+2. Parse the JPEG XR codestream header and index table to recover the exact physical tile
+   boundaries and compressed tile weights.
+3. Request native `128bpp RGBA Float` pixels, bypassing WIC's generic FP32 -> FP16 converter.
+4. Attempt **parallel full-resolution ROI decoding** with independent WIC decoder instances,
+   aligned to the physical JPEG XR tile boundaries.
+5. Convert each decoded region from FP32 to ImageGlass `RGBA16F` with
    `System.Numerics.Tensors.TensorPrimitives.ConvertToHalf` and multiple CPU cores.
-5. If parallel ROI decoding is rejected by the installed codec, fall back to one native
+6. If parallel ROI decoding is rejected by the installed codec, fall back to one native
    full-resolution decode followed by parallel/vectorized FP32 -> FP16 conversion.
-6. Cache recent full-resolution RGBA16F results and metadata so duplicate ImageGlass requests
+7. Cache recent full-resolution RGBA16F results and metadata so duplicate ImageGlass requests
    do not repeat an expensive JPEG XR decode.
 
 The NativeAOT build uses `OptimizationPreference=Speed`.
@@ -52,8 +54,9 @@ Controls the maximum number of independent WIC decoder workers used for parallel
 - Default: all logical processors, clamped to 1-64.
 - Allowed override: `1` through `64`.
 - `FASTJXR_WORKERS=1` disables the parallel ROI attempt and uses the single-decoder path.
-- Strip mode cannot use more workers than the number of 256-pixel JPEG XR tile rows.
-- Grid mode can use horizontal tiles too, allowing more workers on wide/short images.
+- Strip mode cannot use more workers than the number of physical JPEG XR tile rows.
+- Hybrid mode can spend spare workers by splitting the heaviest rows horizontally while still
+  issuing exactly one WIC `CopyPixels` call per decoder.
 
 Example:
 
@@ -68,7 +71,11 @@ more workers are faster. The trace records both requested and actual worker coun
 
 Selects the full-resolution ROI scheduler:
 
-- `strip` (default): one full-width region per worker. This is the proven fast path.
+- `strip` (default): one full-width physical tile-row region per worker. This is the proven
+  fast path.
+- `hybrid`: starts with one physical tile row per worker, then uses the JPEG XR index-table
+  byte weights to split the heaviest rows horizontally when spare workers are available. Each
+  decoder still performs exactly one `CopyPixels` call.
 - `column`: one full-height vertical band per worker. Like strip mode, each decoder performs
   exactly one `CopyPixels` call; it is intended for landscape images with more tile columns
   than tile rows.
@@ -81,12 +88,25 @@ All modes preserve the original source resolution. None requests JPEG XR reduced
 Example:
 
 ```powershell
-$env:FASTJXR_PARTITION = "grid"
+$env:FASTJXR_PARTITION = "hybrid"
 $env:FASTJXR_WORKERS = "24"
 ```
 
 More workers are not guaranteed to be faster because decoder setup, tile scheduling and memory
 bandwidth eventually dominate.
+
+### `FASTJXR_DIRECT_HALF`
+
+Experimental native-half path. Set to `1` to ask `IWICBitmapSourceTransform` whether the
+installed JPEG XR decoder can natively emit `64bpp RGBAHalf`.
+
+The plugin first calls `GetClosestPixelFormat`; direct output is used only when the decoder
+returns the exact RGBAHalf format. Otherwise it automatically falls back to the proven
+RGBA32F + `TensorPrimitives.ConvertToHalf` path.
+
+```powershell
+$env:FASTJXR_DIRECT_HALF = "1"
+```
 
 ### `FASTJXR_TRACE`
 
