@@ -1,0 +1,27 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - "dev/**"
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build-windows-x64:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+      - name: Restore
+        run: dotnet restore source/WicCodec.csproj -r win-x64
+      - name: Publish NativeAOT x64
+        run: dotnet publish source/WicCodec.csproj -c Release -r win-x64 --no-restore -o artifacts/win-x64
+      - name: Upload plugin
+        uses: actions/upload-artifact@v4
+        with:
+          name: fast-jxr-hdr-win-x64
+          path: artifacts/win-x64/
