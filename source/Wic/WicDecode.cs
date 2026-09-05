@@ -116,7 +116,7 @@ internal static unsafe class WicDecode
             return IGStatus.OK;
         }
 
-        var status = DecodeCore(path, frameIndex, 0, 0, outBuf, cancellation);
+        var status = DecodeCore(path, frameIndex, outBuf, cancellation);
         if (status == IGStatus.OK && frameIndex == 0)
         {
             JxrDecodeCache.Store(path, outBuf);
@@ -130,28 +130,14 @@ internal static unsafe class WicDecode
 
 
     /// <summary>
-    /// Decodes one frame no larger than <paramref name="maxWidth"/> x <paramref name="maxHeight"/>,
-    /// for the host's thumbnails and previews.
+    /// Full-resolution decode path. This fork deliberately contains no scaled decode path.
     /// </summary>
-    public static IGStatus DecodeScaled(string path, int frameIndex, int maxWidth, int maxHeight,
-        IGPixelBuffer* outBuf, void* cancellation)
-    {
-        if (maxWidth <= 0 || maxHeight <= 0) return IGStatus.InvalidArg;
-
-        return DecodeCore(path, frameIndex, maxWidth, maxHeight, outBuf, cancellation);
-    }
-
-
-    /// <summary>
-    /// The one decode path. A non-zero box scales the frame down to fit it; 0 means full size.
-    /// </summary>
-    private static IGStatus DecodeCore(string path, int frameIndex, int maxWidth, int maxHeight,
+    private static IGStatus DecodeCore(string path, int frameIndex,
         IGPixelBuffer* outBuf, void* cancellation)
     {
         IWICImagingFactory* factory = null;
         IWICBitmapDecoder* decoder = null;
         IWICBitmapFrameDecode* frame = null;
-        IWICBitmapScaler* scaler = null;
         IWICBitmapSource* converted = null;
         IWICBitmapFlipRotator* rotator = null;
         byte* pixels = null;
@@ -179,8 +165,7 @@ internal static unsafe class WicDecode
             // generic format converter is effectively single-threaded on this path, so decode
             // the native FP32 raster once and fan the FP32->FP16 conversion across all cores.
             // This deliberately trades a large temporary buffer for lower wall-clock latency.
-            if (maxWidth == 0 && maxHeight == 0
-                && orientation == 1
+            if (orientation == 1
                 && sourceFormat == Apis.GUID_WICPixelFormat128bppRGBAFloat)
             {
                 return DecodeRgbaFloat32FullResolution(path, frameIndex, frame, outBuf, cancellation);
@@ -188,17 +173,9 @@ internal static unsafe class WicDecode
 
             var plan = WicPixels.Choose(factory, sourceFormat);
 
-            // Scale, convert, then rotate. The scaler must sit on the FRAME: it reaches the
-            // frame's IWICBitmapSourceTransform there (a JPEG's DCT scales), which the format
-            // converter does not forward. The rotator is format-agnostic, and rotating the
-            // smaller pre-conversion buffer would still need a second pass afterwards.
+            // Convert only when the source is not already in the ImageGlass-facing layout.
+            // Full source dimensions are preserved throughout this fork.
             var source = (IWICBitmapSource*)frame;
-            if (maxWidth > 0 && maxHeight > 0)
-            {
-                var scaled = TryScale(factory, frame, orientation,
-                    (uint)maxWidth, (uint)maxHeight, &scaler);
-                if (scaled != null) source = scaled;
-            }
 
             if (HostChannel.IsCanceled(cancellation)) return IGStatus.Canceled;
 
@@ -255,7 +232,6 @@ internal static unsafe class WicDecode
 
             ComInterop.Release(ref rotator);
             ComInterop.Release(ref converted);
-            ComInterop.Release(ref scaler);
             ComInterop.Release(ref frame);
             ComInterop.Release(ref decoder);
             ComInterop.Release(ref factory);
@@ -640,46 +616,6 @@ internal static unsafe class WicDecode
             ComInterop.Release(ref opened);
             ComInterop.Release(ref stream);
         }
-    }
-
-
-    /// <summary>
-    /// Wraps <paramref name="frame"/> in a scaler that fits the box, or returns <c>null</c> when
-    /// the frame already fits (or the scaler cannot be set up, which is not fatal).
-    /// </summary>
-    /// <remarks>
-    /// The box applies to the UPRIGHT image, so a 90/270 degree orientation swaps the axes before
-    /// the ratio is taken; the resulting scale then applies to the unrotated frame either way.
-    /// </remarks>
-    private static IWICBitmapSource* TryScale(IWICImagingFactory* factory,
-        IWICBitmapFrameDecode* frame, int orientation, uint maxWidth, uint maxHeight,
-        IWICBitmapScaler** outScaler)
-    {
-        uint srcWidth = 0, srcHeight = 0;
-        if (((IWICBitmapSource*)frame)->GetSize(&srcWidth, &srcHeight).Failure) return null;
-        if (srcWidth == 0 || srcHeight == 0) return null;
-
-        var uprightWidth = SwapsAxes(orientation) ? srcHeight : srcWidth;
-        var uprightHeight = SwapsAxes(orientation) ? srcWidth : srcHeight;
-
-        var scale = Math.Min((double)maxWidth / uprightWidth, (double)maxHeight / uprightHeight);
-        if (scale >= 1) return null;
-
-        var targetWidth = Math.Max(1u, (uint)Math.Round(srcWidth * scale));
-        var targetHeight = Math.Max(1u, (uint)Math.Round(srcHeight * scale));
-        if (targetWidth >= srcWidth && targetHeight >= srcHeight) return null;
-
-        if (factory->CreateBitmapScaler(outScaler).Failure) return null;
-
-        // Fant is WIC's box/averaging filter: the right one for a big downscale.
-        if ((*outScaler)->Initialize((IWICBitmapSource*)frame, targetWidth, targetHeight,
-            WICBitmapInterpolationMode.ModeFant).Failure)
-        {
-            ComInterop.Release(ref *outScaler);
-            return null;
-        }
-
-        return (IWICBitmapSource*)*outScaler;
     }
 
 
