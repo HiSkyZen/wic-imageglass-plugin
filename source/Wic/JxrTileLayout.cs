@@ -132,7 +132,7 @@ internal sealed class JxrTileLayout
             var tilingPresent = reader.Read(1) != 0;
             var bitstreamFormat = checked((int)reader.Read(1));
             _ = reader.Read(3); // presentation orientation
-            var hasIndexTable = reader.Read(1) != 0
+            var hasIndexTable = reader.Read(1) != 0;
             var overlap = reader.Read(2);
             if (overlap == 3) return false;
 
@@ -140,7 +140,7 @@ internal sealed class JxrTileLayout
             _ = reader.Read(1); // long-word flag
             var inscribed = reader.Read(1) != 0;
             _ = reader.Read(1); // trim flexbits
-            var tileStretch = reader.Read(1) != 0
+            var tileStretch = reader.Read(1) != 0;
             _ = reader.Read(1); // red/blue swap
             _ = reader.Read(1); // reserved
             _ = reader.Read(1); // alpha
