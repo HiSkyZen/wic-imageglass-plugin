@@ -9,7 +9,7 @@
 
     By default the script:
       1. performs one ignored 8-worker warm-up;
-      2. tests 1, 4, 8, 12 and 16 workers;
+      2. tests strip and grid partitioning across multiple worker counts;
       3. runs three measured repetitions;
       4. alternates ascending/descending worker order to reduce ordering bias;
       5. writes raw.csv, summary.csv and the individual plugin trace logs.
@@ -23,7 +23,7 @@
     Optional path to ImageGlass.exe. If omitted, common install locations and PATH are searched.
 
 .PARAMETER Workers
-    Worker counts to test. Default: 1,4,8,12,16.
+    Requested worker counts to test. Default: 1,2,4,8,12,16,20,24,32,48.
 
 .PARAMETER Repeats
     Number of measured repetitions per worker count. Default: 3.
@@ -52,7 +52,10 @@ param(
     [string] $ImageGlassExe,
 
     [ValidateRange(1, 64)]
-    [int[]] $Workers = @(1, 4, 8, 12, 16),
+    [int[]] $Workers = @(1, 2, 4, 8, 12, 16, 20, 24, 32, 48),
+
+    [ValidateSet('strip', 'grid')]
+    [string[]] $Partitions = @('strip', 'grid'),
 
     [ValidateRange(1, 20)]
     [int] $Repeats = 3,
@@ -151,26 +154,36 @@ function Parse-TraceFile {
     if ($null -eq $timing) { return $null }
 
     $route = 'generic'
+    $partition = 'sequential'
+    $actualWorkers = 1
+
     foreach ($line in $lines) {
-        if ($line -match '\tevent=info\tmessage=parallel ROI path workers=') {
-            $route = 'parallel-roi'
+        if ($line -match '\tevent=info\tmessage=parallel (strip|grid) path requested=([0-9]+), workers=([0-9]+),') {
+            $partition = $matches[1]
+            $actualWorkers = [int]$matches[3]
+            $route = "parallel-$partition"
             break
         }
         if ($line -match '\tevent=info\tmessage=sequential RGBA32F path') {
             $route = 'sequential-rgba32f'
+            $partition = 'sequential'
+            $actualWorkers = 1
         }
     }
 
     return [pscustomobject]@{
-        Status   = $timing.Status
-        DecodeMs = $timing.DecodeMs
-        Route    = $route
+        Status        = $timing.Status
+        DecodeMs      = $timing.DecodeMs
+        Route         = $route
+        Partition     = $partition
+        ActualWorkers = $actualWorkers
     }
 }
 
 function Invoke-FastJxrTrial {
     param(
         [int] $WorkerCount,
+        [string] $Partition,
         [int] $Repeat,
         [string] $TracePath,
         [bool] $Warmup
@@ -183,6 +196,7 @@ function Invoke-FastJxrTrial {
     }
 
     $env:FASTJXR_WORKERS = [string]$WorkerCount
+    $env:FASTJXR_PARTITION = $Partition
     $env:FASTJXR_TRACE = '1'
     $env:FASTJXR_TRACE_FILE = $TracePath
 
@@ -221,13 +235,15 @@ function Invoke-FastJxrTrial {
 
         if (-not $Warmup) {
             return [pscustomobject]@{
-                Worker    = $WorkerCount
-                Repeat    = $Repeat
-                DecodeMs  = [math]::Round($parsed.DecodeMs, 3)
-                Route     = $parsed.Route
-                Status    = $parsed.Status
-                WallMs    = [math]::Round($wall.Elapsed.TotalMilliseconds, 1)
-                TraceFile = [IO.Path]::GetFileName($TracePath)
+                Partition     = $Partition
+                Worker        = $WorkerCount
+                ActualWorkers = $parsed.ActualWorkers
+                Repeat        = $Repeat
+                DecodeMs      = [math]::Round($parsed.DecodeMs, 3)
+                Route         = $parsed.Route
+                Status        = $parsed.Status
+                WallMs        = [math]::Round($wall.Elapsed.TotalMilliseconds, 1)
+                TraceFile     = [IO.Path]::GetFileName($TracePath)
             }
         }
     }
@@ -270,6 +286,7 @@ New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
 
 # Save and restore the caller's environment.
 $oldWorkers = $env:FASTJXR_WORKERS
+$oldPartition = $env:FASTJXR_PARTITION
 $oldTrace = $env:FASTJXR_TRACE
 $oldTraceFile = $env:FASTJXR_TRACE_FILE
 
@@ -281,6 +298,7 @@ try {
     Write-Host "  Image:       $JxrPathResolved"
     Write-Host "  ImageGlass:  $ImageGlassExeResolved"
     Write-Host "  Workers:     $($Workers -join ', ')"
+    Write-Host "  Partitions:  $($Partitions -join ', ')"
     Write-Host "  Repeats:     $Repeats"
     Write-Host "  Output:      $OutputDirectory"
     Write-Host ""
@@ -293,7 +311,7 @@ try {
 
         Write-Host ("Warm-up  workers={0} ..." -f $warmWorker) -NoNewline
         try {
-            $null = Invoke-FastJxrTrial -WorkerCount $warmWorker -Repeat 0 -TracePath $warmTrace -Warmup $true
+            $null = Invoke-FastJxrTrial -WorkerCount $warmWorker -Partition 'strip' -Repeat 0 -TracePath $warmTrace -Warmup $true
             $warmParsed = Parse-TraceFile -Path $warmTrace
             if ($warmParsed) {
                 Write-Host (" {0:N1} ms [{1}]" -f $warmParsed.DecodeMs, $warmParsed.Route) -ForegroundColor DarkGray
@@ -309,41 +327,51 @@ try {
     }
 
     for ($repeat = 1; $repeat -le $Repeats; $repeat++) {
-        $order = @($Workers)
+        $workerOrder = @($Workers)
         if (($repeat % 2) -eq 0) {
-            [array]::Reverse($order)
+            [array]::Reverse($workerOrder)
         }
 
-        foreach ($worker in $order) {
-            $traceName = "run-r{0:D2}-w{1:D2}.log" -f $repeat, $worker
-            $tracePath = Join-Path $OutputDirectory $traceName
+        $partitionOrder = @($Partitions)
+        if (($repeat % 2) -eq 0) {
+            [array]::Reverse($partitionOrder)
+        }
 
-            Write-Host ("Run {0}/{1}  workers={2,2} ..." -f $repeat, $Repeats, $worker) -NoNewline
+        foreach ($partition in $partitionOrder) {
+            foreach ($worker in $workerOrder) {
+                $traceName = "run-r{0:D2}-{1}-w{2:D2}.log" -f $repeat, $partition, $worker
+                $tracePath = Join-Path $OutputDirectory $traceName
 
-            try {
-                $result = Invoke-FastJxrTrial `
-                    -WorkerCount $worker `
-                    -Repeat $repeat `
-                    -TracePath $tracePath `
-                    -Warmup $false
+                Write-Host ("Run {0}/{1}  {2,-5} requested={3,2} ..." -f $repeat, $Repeats, $partition, $worker) -NoNewline
 
-                $results.Add($result)
-                Write-Host (" {0,8:N1} ms  {1}" -f $result.DecodeMs, $result.Route) -ForegroundColor Green
-            }
-            catch {
-                $failure = [pscustomobject]@{
-                    Worker    = $worker
-                    Repeat    = $repeat
-                    DecodeMs  = [double]::NaN
-                    Route     = 'failed'
-                    Status    = 'FAILED'
-                    WallMs    = [double]::NaN
-                    TraceFile = $traceName
+                try {
+                    $result = Invoke-FastJxrTrial `
+                        -WorkerCount $worker `
+                        -Partition $partition `
+                        -Repeat $repeat `
+                        -TracePath $tracePath `
+                        -Warmup $false
+
+                    $results.Add($result)
+                    Write-Host (" {0,8:N1} ms  actual={1,2}  {2}" -f $result.DecodeMs, $result.ActualWorkers, $result.Route) -ForegroundColor Green
                 }
-                $results.Add($failure)
+                catch {
+                    $failure = [pscustomobject]@{
+                        Partition     = $partition
+                        Worker        = $worker
+                        ActualWorkers = 0
+                        Repeat        = $repeat
+                        DecodeMs      = [double]::NaN
+                        Route         = 'failed'
+                        Status        = 'FAILED'
+                        WallMs        = [double]::NaN
+                        TraceFile     = $traceName
+                    }
+                    $results.Add($failure)
 
-                Write-Host " FAILED" -ForegroundColor Red
-                Write-Warning $_.Exception.Message
+                    Write-Host " FAILED" -ForegroundColor Red
+                    Write-Warning $_.Exception.Message
+                }
             }
         }
     }
@@ -352,6 +380,7 @@ finally {
     Stop-AllImageGlass
 
     $env:FASTJXR_WORKERS = $oldWorkers
+    $env:FASTJXR_PARTITION = $oldPartition
     $env:FASTJXR_TRACE = $oldTrace
     $env:FASTJXR_TRACE_FILE = $oldTraceFile
 }
@@ -359,38 +388,46 @@ finally {
 $rawPath = Join-Path $OutputDirectory 'raw.csv'
 $results | Export-Csv -LiteralPath $rawPath -NoTypeInformation -Encoding UTF8
 
-$summary = foreach ($worker in $Workers) {
-    $valid = @($results | Where-Object {
-        $_.Worker -eq $worker -and
-        $_.Status -ne 'FAILED' -and
-        -not [double]::IsNaN([double]$_.DecodeMs)
-    })
+$summary = foreach ($partition in $Partitions) {
+    foreach ($worker in $Workers) {
+        $valid = @($results | Where-Object {
+            $_.Partition -eq $partition -and
+            $_.Worker -eq $worker -and
+            $_.Status -ne 'FAILED' -and
+            -not [double]::IsNaN([double]$_.DecodeMs)
+        })
 
-    if ($valid.Count -eq 0) {
-        [pscustomobject]@{
-            Worker   = $worker
-            Runs     = 0
-            MedianMs = [double]::NaN
-            MeanMs   = [double]::NaN
-            BestMs   = [double]::NaN
-            WorstMs  = [double]::NaN
-            Route    = 'failed'
+        if ($valid.Count -eq 0) {
+            [pscustomobject]@{
+                Partition     = $partition
+                Worker        = $worker
+                ActualWorkers = 0
+                Runs          = 0
+                MedianMs      = [double]::NaN
+                MeanMs        = [double]::NaN
+                BestMs        = [double]::NaN
+                WorstMs       = [double]::NaN
+                Route         = 'failed'
+            }
+            continue
         }
-        continue
-    }
 
-    $values = [double[]]@($valid | ForEach-Object { [double]$_.DecodeMs })
-    $measure = $values | Measure-Object -Average -Minimum -Maximum
-    $route = (($valid | Group-Object Route | Sort-Object Count -Descending | Select-Object -First 1).Name)
+        $values = [double[]]@($valid | ForEach-Object { [double]$_.DecodeMs })
+        $measure = $values | Measure-Object -Average -Minimum -Maximum
+        $route = (($valid | Group-Object Route | Sort-Object Count -Descending | Select-Object -First 1).Name)
+        $actualWorkers = (($valid | Group-Object ActualWorkers | Sort-Object Count -Descending | Select-Object -First 1).Name)
 
-    [pscustomobject]@{
-        Worker   = $worker
-        Runs     = $valid.Count
-        MedianMs = [math]::Round((Get-Median $values), 3)
-        MeanMs   = [math]::Round([double]$measure.Average, 3)
-        BestMs   = [math]::Round([double]$measure.Minimum, 3)
-        WorstMs  = [math]::Round([double]$measure.Maximum, 3)
-        Route    = $route
+        [pscustomobject]@{
+            Partition     = $partition
+            Worker        = $worker
+            ActualWorkers = [int]$actualWorkers
+            Runs          = $valid.Count
+            MedianMs      = [math]::Round((Get-Median $values), 3)
+            MeanMs        = [math]::Round([double]$measure.Average, 3)
+            BestMs        = [math]::Round([double]$measure.Minimum, 3)
+            WorstMs       = [math]::Round([double]$measure.Maximum, 3)
+            Route         = $route
+        }
     }
 }
 
@@ -425,11 +462,11 @@ $summary |
         if ([double]::IsNaN([double]$_.MedianMs)) { [double]::PositiveInfinity }
         else { [double]$_.MedianMs }
     }} |
-    Format-Table Worker, Runs, MedianMs, MeanMs, BestMs, WorstMs, RelativeToBest, Route -AutoSize
+    Format-Table Partition, Worker, ActualWorkers, Runs, MedianMs, MeanMs, BestMs, WorstMs, RelativeToBest, Route -AutoSize
 
 if ($validSummary.Count -gt 0) {
     $winner = $validSummary | Sort-Object MedianMs | Select-Object -First 1
-    Write-Host ("Best median: FASTJXR_WORKERS={0}  ({1:N3} ms)" -f $winner.Worker, $winner.MedianMs) -ForegroundColor Green
+    Write-Host ("Best median: FASTJXR_PARTITION={0}, FASTJXR_WORKERS={1} (actual={2})  ({3:N3} ms)" -f $winner.Partition, $winner.Worker, $winner.ActualWorkers, $winner.MedianMs) -ForegroundColor Green
 }
 
 Write-Host ""
