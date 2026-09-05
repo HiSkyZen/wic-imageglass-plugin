@@ -38,6 +38,9 @@ internal static unsafe class WicDecode
     /// </summary>
     public static IGStatus LoadMetadata(string path, IGImageInfo* outInfo, void* cancellation)
     {
+        if (HostChannel.IsCanceled(cancellation)) return IGStatus.Canceled;
+        if (JxrMetadataCache.TryFill(path, outInfo)) return IGStatus.OK;
+
         IWICImagingFactory* factory = null;
         IWICBitmapDecoder* decoder = null;
         IWICBitmapFrameDecode* frame = null;
@@ -78,7 +81,8 @@ internal static unsafe class WicDecode
             // host that honors it rotate a second time.
             outInfo->Orientation = 1;
 
-            ApplyColorProfile(factory, frame, outInfo);
+            ApplyColorProfile(factory, frame, outInfo, out var iccBytes);
+            JxrMetadataCache.Store(path, outInfo, iccBytes);
             return IGStatus.OK;
         }
         finally
@@ -743,8 +747,9 @@ internal static unsafe class WicDecode
     /// Publishes the frame's embedded ICC profile, or falls back to its EXIF color-space tag.
     /// </summary>
     private static void ApplyColorProfile(IWICImagingFactory* factory, IWICBitmapFrameDecode* frame,
-        IGImageInfo* outInfo)
+        IGImageInfo* outInfo, out byte[]? iccBytes)
     {
+        iccBytes = null;
         uint count = 0;
         if (frame->GetColorContexts(0, null, &count).Failure || count == 0) return;
 
@@ -774,7 +779,8 @@ internal static unsafe class WicDecode
                 WICColorContextType type;
                 if (context->GetType(&type).Failure) continue;
 
-                if (type == Apis.WICColorContextProfile && TryPublishProfile(context, outInfo)) return;
+                if (type == Apis.WICColorContextProfile
+                    && TryPublishProfile(context, outInfo, out iccBytes)) return;
 
                 if (type == Apis.WICColorContextExifColorSpace)
                 {
@@ -801,8 +807,10 @@ internal static unsafe class WicDecode
     }
 
 
-    private static bool TryPublishProfile(IWICColorContext* context, IGImageInfo* outInfo)
+    private static bool TryPublishProfile(IWICColorContext* context, IGImageInfo* outInfo,
+        out byte[]? profileBytes)
     {
+        profileBytes = null;
         uint size = 0;
         if (context->GetProfileBytes(0, null, &size).Failure || size == 0) return false;
 
@@ -815,8 +823,10 @@ internal static unsafe class WicDecode
         var block = NativeBuffers.PublishIccProfile(bytes.AsSpan(0, (int)Math.Min(size, bytes.Length)));
         if (block == null) return false;
 
+        var actualSize = (int)Math.Min(size, bytes.Length);
         outInfo->IccProfileData = block;
-        outInfo->IccProfileSize = (int)Math.Min(size, bytes.Length);
+        outInfo->IccProfileSize = actualSize;
+        profileBytes = actualSize == bytes.Length ? bytes : bytes.AsSpan(0, actualSize).ToArray();
         return true;
     }
 
