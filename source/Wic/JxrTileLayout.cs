@@ -11,6 +11,7 @@ internal sealed class JxrTileLayout
 {
     public required int[] X { get; init; }
     public required int[] Y { get; init; }
+    public ulong[]? TileWeights { get; init; }
 
     public int Columns => X.Length - 1;
     public int Rows => Y.Length - 1;
@@ -108,7 +109,7 @@ internal sealed class JxrTileLayout
                 4096,
                 FileOptions.RandomAccess);
 
-            if (!TryLocateCodestream(stream, out var imageOffset)) return false;
+            if (!TryLocateCodestream(stream, out var imageOffset, out var imageByteCount)) return false;
 
             stream.Position = imageOffset;
 
@@ -129,23 +130,23 @@ internal sealed class JxrTileLayout
             _ = reader.Read(4); // codec subversion
 
             var tilingPresent = reader.Read(1) != 0;
-            _ = reader.Read(1); // bitstream layout
+            var bitstreamFormat = checked((int)reader.Read(1));
             _ = reader.Read(3); // presentation orientation
-            _ = reader.Read(1); // index table
+            var hasIndexTable = reader.Read(1) != 0
             var overlap = reader.Read(2);
             if (overlap == 3) return false;
 
             var abbreviatedHeader = reader.Read(1) != 0;
             _ = reader.Read(1); // long-word flag
-            _ = reader.Read(1); // inscribed/windowing
+            var inscribed = reader.Read(1) != 0;
             _ = reader.Read(1); // trim flexbits
-            _ = reader.Read(1); // tile stretch
+            var tileStretch = reader.Read(1) != 0
             _ = reader.Read(1); // red/blue swap
             _ = reader.Read(1); // reserved
             _ = reader.Read(1); // alpha
 
             _ = reader.Read(4); // source color format
-            _ = reader.Read(4); // source bit depth
+            var sourceBitDepth = checked((int)reader.Read(4));
 
             var sizeBits = abbreviatedHeader ? 16 : 32;
             var width64 = (long)reader.Read(sizeBits) + 1;
@@ -201,7 +202,32 @@ internal sealed class JxrTileLayout
             }
             y[^1] = height;
 
-            layout = new JxrTileLayout { X = x, Y = y };
+            if (tileStretch)
+            {
+                for (var i = 0; i < checked(columns * rows); i++) _ = reader.Read(8);
+            }
+
+            if (inscribed)
+            {
+                _ = reader.Read(6);
+                _ = reader.Read(6);
+                _ = reader.Read(6);
+                _ = reader.Read(6);
+            }
+
+            ulong[]? tileWeights = null;
+            var weightReader = reader;
+            _ = TryReadTileWeights(
+                ref weightReader,
+                sourceBitDepth,
+                bitstreamFormat,
+                hasIndexTable,
+                columns,
+                rows,
+                imageByteCount,
+                out tileWeights);
+
+            layout = new JxrTileLayout { X = x, Y = y, TileWeights = tileWeights };
             return true;
         }
         catch
@@ -212,11 +238,188 @@ internal sealed class JxrTileLayout
     }
 
 
-    private static bool TryLocateCodestream(FileStream stream, out long imageOffset)
+    private static bool TryReadTileWeights(ref MsbBitReader reader,
+        int sourceBitDepth, int bitstreamFormat, bool hasIndexTable,
+        int columns, int rows, long imageByteCount, out ulong[]? weights)
+    {
+        weights = null;
+        if (!hasIndexTable || columns <= 0 || rows <= 0 || imageByteCount <= 0) return false;
+
+        try
+        {
+            reader.AlignByte();
+
+            var internalColor = checked((int)reader.Read(3));
+            _ = reader.Read(1); // scaled arithmetic
+            var subband = checked((int)reader.Read(4));
+
+            var channels = internalColor switch
+            {
+                0 => 1, // Y_ONLY
+                1 or 2 or 3 => 3,
+                4 => 4, // CMYK
+                6 => checked((int)reader.Read(4) + 1), // NCOMPONENT
+                _ => 0,
+            };
+            if (channels <= 0 || channels > 16) return false;
+
+            if (internalColor is 1 or 2 or 3)
+            {
+                _ = reader.Read(8);
+            }
+            else if (internalColor == 6)
+            {
+                _ = reader.Read(4);
+            }
+
+            // Source BITDEPTH_BITS: 16/16S/32/32S have one 8-bit parameter;
+            // 32F has mantissa length + exponent bias.
+            if (sourceBitDepth is 2 or 3 or 5 or 6)
+            {
+                _ = reader.Read(8);
+            }
+            else if (sourceBitDepth == 7)
+            {
+                _ = reader.Read(8);
+                _ = reader.Read(8);
+            }
+
+            if (reader.Read(1) != 0) SkipQuantizer(ref reader, channels);
+
+            if (subband != 3) // not DC-only
+            {
+                if (reader.Read(1) == 0 && reader.Read(1) != 0)
+                {
+                    SkipQuantizer(ref reader, channels);
+                }
+
+                if (subband != 2) // not "no highpass"
+                {
+                    if (reader.Read(1) == 0 && reader.Read(1) != 0)
+                    {
+                        SkipQuantizer(ref reader, channels);
+                    }
+                }
+            }
+
+            reader.AlignByte();
+
+            var bands = subband switch
+            {
+                3 => 1,
+                2 => 2,
+                1 => 3,
+                0 => 4,
+                _ => 0,
+            };
+            if (bands == 0) return false;
+
+            var bitIoCount = bitstreamFormat == 0
+                ? columns
+                : checked(columns * bands);
+            var entryCount = checked(bitIoCount * rows);
+            if (entryCount <= 0 || entryCount > 16_777_216) return false;
+
+            if (reader.Read(16) != 1) return false;
+
+            var offsets = new ulong[entryCount];
+            for (var i = 0; i < entryCount; i++)
+            {
+                offsets[i] = ReadVlWord(ref reader);
+            }
+
+            var extraHeaderBytes = ReadVlWord(ref reader);
+            reader.AlignByte();
+
+            var dataStart = checked((ulong)reader.BytePosition + extraHeaderBytes);
+            var codestreamBytes = checked((ulong)imageByteCount);
+            if (dataStart >= codestreamBytes) return false;
+
+            var tileCount = checked(columns * rows);
+            var firstBandStride = bitstreamFormat == 0 ? 1 : bands;
+            var result = new ulong[tileCount];
+
+            for (var tile = 0; tile < tileCount; tile++)
+            {
+                var offsetIndex = checked(tile * firstBandStride);
+                var start = offsets[offsetIndex];
+
+                ulong end;
+                if (tile + 1 < tileCount)
+                {
+                    end = offsets[checked((tile + 1) * firstBandStride)];
+                }
+                else
+                {
+                    end = codestreamBytes - dataStart;
+                }
+
+                if (end < start) return false;
+                result[tile] = end - start;
+            }
+
+            weights = result;
+            return true;
+        }
+        catch
+        {
+            weights = null;
+            return false;
+        }
+    }
+
+
+    private static void SkipQuantizer(ref MsbBitReader reader, int channels)
+    {
+        var mode = channels > 1 ? checked((int)reader.Read(2)) : 0;
+        _ = reader.Read(8);
+
+        if (mode == 1)
+        {
+            _ = reader.Read(8);
+        }
+        else if (mode > 1)
+        {
+            for (var i = 1; i < channels; i++) _ = reader.Read(8);
+        }
+    }
+
+
+    private static ulong ReadVlWord(ref MsbBitReader reader)
+    {
+        reader.AlignByte();
+
+        var prefix = reader.Read(8);
+        if (prefix is 0xFD or 0xFE or 0xFF) return 0;
+
+        if (prefix < 0xFB)
+        {
+            return ((ulong)prefix << 8) | reader.Read(8);
+        }
+
+        var large = prefix - 0xFB;
+        ulong value = 0;
+
+        if (large != 0)
+        {
+            value = (ulong)reader.Read(16) << 16;
+            value = (value | reader.Read(16)) << 16;
+            value <<= 16;
+        }
+
+        value |= (ulong)reader.Read(16) << 16;
+        value |= reader.Read(16);
+        return value;
+    }
+
+
+    private static bool TryLocateCodestream(FileStream stream, out long imageOffset,
+        out long imageByteCount)
     {
         imageOffset = 0;
+        imageByteCount = 0;
 
-        // JXR is a TIFF-like little-endian container. BCC0 is ImageOffset.
+        // JXR is a TIFF-like little-endian container. BCC0/BCC1 are ImageOffset/ImageByteCount.
         Span<byte> header = stackalloc byte[8];
         stream.Position = 0;
         if (stream.Read(header) == header.Length
@@ -233,25 +436,32 @@ internal sealed class JxrTileLayout
                 {
                     var count = BinaryPrimitives.ReadUInt16LittleEndian(countBytes);
                     Span<byte> entry = stackalloc byte[12];
+                    long candidateOffset = 0;
+                    long candidateCount = 0;
 
                     for (var i = 0; i < count; i++)
                     {
                         if (stream.Read(entry) != entry.Length) break;
 
                         var tag = BinaryPrimitives.ReadUInt16LittleEndian(entry[0..2]);
-                        if (tag != 0xBCC0) continue;
-
                         var type = BinaryPrimitives.ReadUInt16LittleEndian(entry[2..4]);
                         var valueCount = BinaryPrimitives.ReadUInt32LittleEndian(entry[4..8]);
-                        if (type == 4 && valueCount == 1)
-                        {
-                            var offset = BinaryPrimitives.ReadUInt32LittleEndian(entry[8..12]);
-                            if (offset < stream.Length - 8 && HasSignatureAt(stream, offset))
-                            {
-                                imageOffset = offset;
-                                return true;
-                            }
-                        }
+                        if (type != 4 || valueCount != 1) continue;
+
+                        var value = BinaryPrimitives.ReadUInt32LittleEndian(entry[8..12]);
+                        if (tag == 0xBCC0) candidateOffset = value;
+                        else if (tag == 0xBCC1) candidateCount = value;
+                    }
+
+                    if (candidateOffset > 0
+                        && candidateOffset < stream.Length - 8
+                        && HasSignatureAt(stream, candidateOffset))
+                    {
+                        imageOffset = candidateOffset;
+                        imageByteCount = candidateCount > 0
+                            ? Math.Min(candidateCount, stream.Length - candidateOffset)
+                            : stream.Length - candidateOffset;
+                        return true;
                     }
                 }
             }
@@ -268,6 +478,7 @@ internal sealed class JxrTileLayout
         if (index < 0) return false;
 
         imageOffset = index;
+        imageByteCount = stream.Length - imageOffset;
         return true;
     }
 
@@ -324,6 +535,15 @@ internal sealed class JxrTileLayout
             _data = data;
             _bitOffset = 0;
         }
+
+        public int BytePosition => _bitOffset >> 3;
+
+
+        public void AlignByte()
+        {
+            _bitOffset = (_bitOffset + 7) & ~7;
+        }
+
 
         public uint Read(int count)
         {
