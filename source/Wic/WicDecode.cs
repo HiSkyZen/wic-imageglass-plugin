@@ -87,7 +87,7 @@ internal static unsafe class WicDecode
             outInfo->Orientation = 1;
 
             ApplyColorProfile(factory, frame, outInfo, out var iccBytes);
-            JxrMetadataCache.Store(path, outInfo, iccBytes);
+            JxrMetadataCache.Store(path, outInfo, iccBytes, sourceFormat, orientation);
             FastJxrTrace.End("metadata WIC load", traceStart);
             return IGStatus.OK;
         }
@@ -165,8 +165,12 @@ internal static unsafe class WicDecode
             if (decoder->GetFrame((uint)frameIndex, &frame).Failure) return IGStatus.DecodeFailed;
 
             Guid sourceFormat;
-            if (frame->GetPixelFormat(&sourceFormat).Failure) sourceFormat = default;
-            var orientation = ReadOrientation(frame);
+            int orientation;
+            if (!JxrMetadataCache.TryGetDecodeTraits(path, out sourceFormat, out orientation))
+            {
+                if (frame->GetPixelFormat(&sourceFormat).Failure) sourceFormat = default;
+                orientation = ReadOrientation(frame);
+            }
 
             // The HDR files this fork is optimized for are 128bpp RGBA float JXR. WIC's
             // generic format converter is effectively single-threaded on this path, so decode
