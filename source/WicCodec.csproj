@@ -13,6 +13,7 @@
     <!-- Native shared library produced by Native AOT. -->
     <OutputType>Library</OutputType>
     <PublishAot>true</PublishAot>
+    <OptimizationPreference>Speed</OptimizationPreference>
     <NativeLib>Shared</NativeLib>
     <SelfContained>true</SelfContained>
 
