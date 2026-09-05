@@ -38,8 +38,13 @@ internal static unsafe class WicDecode
     /// </summary>
     public static IGStatus LoadMetadata(string path, IGImageInfo* outInfo, void* cancellation)
     {
+        var traceStart = FastJxrTrace.Start();
         if (HostChannel.IsCanceled(cancellation)) return IGStatus.Canceled;
-        if (JxrMetadataCache.TryFill(path, outInfo)) return IGStatus.OK;
+        if (JxrMetadataCache.TryFill(path, outInfo))
+        {
+            FastJxrTrace.End("metadata cache hit", traceStart);
+            return IGStatus.OK;
+        }
 
         IWICImagingFactory* factory = null;
         IWICBitmapDecoder* decoder = null;
@@ -83,6 +88,7 @@ internal static unsafe class WicDecode
 
             ApplyColorProfile(factory, frame, outInfo, out var iccBytes);
             JxrMetadataCache.Store(path, outInfo, iccBytes);
+            FastJxrTrace.End("metadata WIC load", traceStart);
             return IGStatus.OK;
         }
         finally
@@ -99,11 +105,14 @@ internal static unsafe class WicDecode
     /// </summary>
     public static IGStatus Decode(string path, int frameIndex, IGPixelBuffer* outBuf, void* cancellation)
     {
+        var traceStart = FastJxrTrace.Start();
+
         // ImageGlass can ask the codec for the same still more than once while transitioning
         // from metadata/preview to the final view. Full-resolution decoding is expensive, so a
         // short-lived native cache turns duplicate requests into a single memory copy.
         if (frameIndex == 0 && JxrDecodeCache.TryCopyToHost(path, outBuf))
         {
+            FastJxrTrace.End("full-res pixel cache hit", traceStart);
             return IGStatus.OK;
         }
 
@@ -112,6 +121,7 @@ internal static unsafe class WicDecode
         {
             JxrDecodeCache.Store(path, outBuf);
         }
+        FastJxrTrace.End($"full-res decode ({status})", traceStart);
         return status;
     }
 
@@ -269,12 +279,14 @@ internal static unsafe class WicDecode
 
             if (parallelStatus == IGStatus.OK || parallelStatus == IGStatus.Canceled)
             {
+                FastJxrTrace.Info($"parallel ROI path workers={workers}, size={width}x{height}, status={parallelStatus}");
                 return parallelStatus;
             }
 
             HostChannel.Log(3, $"FastJXR: parallel ROI decode fell back to single decoder ({parallelStatus}).");
         }
 
+        FastJxrTrace.Info($"sequential RGBA32F path size={width}x{height}");
         return DecodeRgbaFloat32Sequential(frame, width, height, outBuf, cancellation);
     }
 
