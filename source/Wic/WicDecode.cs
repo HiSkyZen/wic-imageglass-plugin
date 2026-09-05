@@ -109,7 +109,7 @@ internal static unsafe class WicDecode
 
         // ImageGlass can ask the codec for the same still more than once while transitioning
         // from metadata/preview to the final view. Full-resolution decoding is expensive, so a
-        // short-lived native cache turns duplicate requests into a single memory copy.
+        // short-lived native cache turns duplicate requests into a ref-counted zero-copy hit.
         if (frameIndex == 0 && JxrDecodeCache.TryCopyToHost(path, outBuf))
         {
             FastJxrTrace.End("full-res pixel cache hit", traceStart);
@@ -121,7 +121,10 @@ internal static unsafe class WicDecode
         {
             JxrDecodeCache.Store(path, outBuf);
         }
-        FastJxrTrace.End($"full-res decode ({status})", traceStart);
+        if (FastJxrTrace.Enabled)
+        {
+            FastJxrTrace.End($"full-res decode ({status})", traceStart);
+        }
         return status;
     }
 
@@ -283,14 +286,20 @@ internal static unsafe class WicDecode
 
             if (parallelStatus == IGStatus.OK || parallelStatus == IGStatus.Canceled)
             {
-                FastJxrTrace.Info($"parallel ROI path workers={workers}, size={width}x{height}, status={parallelStatus}");
+                if (FastJxrTrace.Enabled)
+                {
+                    FastJxrTrace.Info($"parallel ROI path workers={workers}, size={width}x{height}, status={parallelStatus}");
+                }
                 return parallelStatus;
             }
 
             HostChannel.Log(3, $"FastJXR: parallel ROI decode fell back to single decoder ({parallelStatus}).");
         }
 
-        FastJxrTrace.Info($"sequential RGBA32F path size={width}x{height}");
+        if (FastJxrTrace.Enabled)
+        {
+            FastJxrTrace.Info($"sequential RGBA32F path size={width}x{height}");
+        }
         return DecodeRgbaFloat32Sequential(frame, width, height, outBuf, cancellation);
     }
 
