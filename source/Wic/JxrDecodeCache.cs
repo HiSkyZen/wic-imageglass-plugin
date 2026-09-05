@@ -3,14 +3,13 @@ Fast JXR HDR decode cache for ImageGlass.
 Derived from the WIC codec plugin architecture; MIT License.
 */
 using ImageGlass.SDK.Plugins;
-using System.Runtime.InteropServices;
 
 namespace WicCodec.Wic;
 
 /// <summary>
 /// Small full-resolution RGBA cache used to collapse duplicate ImageGlass decode requests.
-/// Entries are private immutable native copies; callers always receive their own host-owned buffer,
-/// so the cache never depends on the host treating returned pixels as read-only.
+/// ImageGlass wraps plugin buffers as immutable SKImage pixel storage, so the cache retains a
+/// reference to the exact same native buffer instead of copying hundreds of MiB per request.
 /// </summary>
 internal static unsafe class JxrDecodeCache
 {
@@ -52,19 +51,15 @@ internal static unsafe class JxrDecodeCache
             }
 
             if (hit is null || hit.Data == 0 || hit.ByteCount == 0) return false;
+            if (!NativeBuffers.RetainPixels((void*)hit.Data)) return false;
 
-            var pixels = NativeBuffers.AllocPixels(hit.ByteCount);
-            if (pixels == null) return false;
-
-            Buffer.MemoryCopy((void*)hit.Data, pixels, hit.ByteCount, hit.ByteCount);
             hit.LastUse = ++_clock;
-
-            outBuf->Data = pixels;
+            outBuf->Data = (byte*)hit.Data;
             outBuf->Width = hit.Width;
             outBuf->Height = hit.Height;
             outBuf->Stride = hit.Stride;
             outBuf->PixelFormat = hit.PixelFormat;
-            outBuf->ReleaseContext = pixels;
+            outBuf->ReleaseContext = (void*)hit.Data;
             return true;
         }
     }
@@ -81,13 +76,12 @@ internal static unsafe class JxrDecodeCache
         if (byteCount64 <= 0 || byteCount64 > MaxBytes) return;
 
         var byteCount = (nuint)byteCount64;
-        var copy = NativeMemory.Alloc(byteCount);
-        if (copy == null) return;
-
-        Buffer.MemoryCopy(buffer->Data, copy, byteCount, byteCount);
 
         lock (_lock)
         {
+            // Retain before publishing the entry. Decode() calls Store() before returning the
+            // initial host reference, so the buffer cannot disappear during this operation.
+            if (!NativeBuffers.RetainPixels(buffer->Data)) return;
             // Replace a stale/older copy of the same path.
             for (var i = _entries.Count - 1; i >= 0; i--)
             {
@@ -100,7 +94,7 @@ internal static unsafe class JxrDecodeCache
                 Path = path,
                 FileLength = length,
                 LastWriteTicks = ticks,
-                Data = (nint)copy,
+                Data = (nint)buffer->Data,
                 ByteCount = byteCount,
                 Width = buffer->Width,
                 Height = buffer->Height,
@@ -109,7 +103,6 @@ internal static unsafe class JxrDecodeCache
                 LastUse = ++_clock,
             });
             _residentBytes += byteCount64;
-            copy = null;
 
             while (_entries.Count > MaxEntries || _residentBytes > MaxBytes)
             {
@@ -124,8 +117,6 @@ internal static unsafe class JxrDecodeCache
                 RemoveAt(victim);
             }
         }
-
-        NativeMemory.Free(copy);
     }
 
     private static void RemoveAt(int index)
@@ -133,7 +124,7 @@ internal static unsafe class JxrDecodeCache
         var entry = _entries[index];
         _entries.RemoveAt(index);
         _residentBytes -= (long)entry.ByteCount;
-        NativeMemory.Free((void*)entry.Data);
+        NativeBuffers.FreePixels((void*)entry.Data);
     }
 
     private static bool TryGetStamp(string path, out long length, out long ticks)
