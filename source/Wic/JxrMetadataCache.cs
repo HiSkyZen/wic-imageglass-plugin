@@ -28,6 +28,8 @@ internal static unsafe class JxrMetadataCache
         public long FileSizeBytes;
         public int Orientation;
         public int ColorSpace;
+        public Guid SourcePixelFormat;
+        public int SourceOrientation;
         public byte[]? Icc;
         public long LastUse;
     }
@@ -79,7 +81,32 @@ internal static unsafe class JxrMetadataCache
         }
     }
 
-    public static void Store(string path, IGImageInfo* info, byte[]? icc)
+    public static bool TryGetDecodeTraits(string path, out Guid sourcePixelFormat, out int sourceOrientation)
+    {
+        sourcePixelFormat = default;
+        sourceOrientation = 1;
+        if (!TryGetStamp(path, out var length, out var ticks)) return false;
+
+        lock (_lock)
+        {
+            foreach (var entry in _entries)
+            {
+                if (!StringComparer.OrdinalIgnoreCase.Equals(entry.Path, path)) continue;
+                if (entry.FileLength != length || entry.LastWriteTicks != ticks) continue;
+                if (entry.SourcePixelFormat == default) return false;
+
+                entry.LastUse = ++_clock;
+                sourcePixelFormat = entry.SourcePixelFormat;
+                sourceOrientation = entry.SourceOrientation;
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    public static void Store(string path, IGImageInfo* info, byte[]? icc,
+        Guid sourcePixelFormat, int sourceOrientation)
     {
         if (info == null || !TryGetStamp(path, out var length, out var ticks)) return;
 
@@ -107,6 +134,8 @@ internal static unsafe class JxrMetadataCache
                 FileSizeBytes = info->FileSizeBytes,
                 Orientation = info->Orientation,
                 ColorSpace = info->ColorSpace,
+                SourcePixelFormat = sourcePixelFormat,
+                SourceOrientation = sourceOrientation,
                 Icc = icc,
                 LastUse = ++_clock,
             });
