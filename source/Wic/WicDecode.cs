@@ -262,10 +262,13 @@ internal static unsafe class WicDecode
             var parallelStatus = IGStatus.Unsupported;
             var actualWorkers = 1;
 
+            var exactLayout = JxrTileLayout.TryGet(
+                path, (int)width, (int)height, out var tileLayout) && tileLayout is not null;
+
             if (partition == "grid")
             {
-                var tileColumns = ((int)width + 255) / 256;
-                var tileRows = ((int)height + 255) / 256;
+                var tileColumns = tileLayout?.Columns ?? (((int)width + 255) / 256);
+                var tileRows = tileLayout?.Rows ?? (((int)height + 255) / 256);
                 actualWorkers = Math.Min(configuredWorkers, checked(tileColumns * tileRows));
 
                 parallelStatus = TryDecodeRgbaFloat32TileGrid(
@@ -273,19 +276,27 @@ internal static unsafe class WicDecode
             }
             else if (partition == "column")
             {
-                var tileColumns = Math.Max(1, ((int)width + 255) / 256);
-                actualWorkers = Math.Min(configuredWorkers, tileColumns);
+                var boundaries = tileLayout?.X ?? BuildFallbackBoundaries((int)width);
+                actualWorkers = Math.Min(configuredWorkers, boundaries.Length - 1);
 
-                parallelStatus = TryDecodeRgbaFloat32Columns(
-                    path, frameIndex, width, height, actualWorkers, outBuf, cancellation);
+                if (actualWorkers > 1)
+                {
+                    parallelStatus = TryDecodeRgbaFloat32Columns(
+                        path, frameIndex, width, height, boundaries,
+                        actualWorkers, outBuf, cancellation);
+                }
             }
             else
             {
-                var tileRows = Math.Max(1, ((int)height + 255) / 256);
-                actualWorkers = Math.Min(configuredWorkers, tileRows);
+                var boundaries = tileLayout?.Y ?? BuildFallbackBoundaries((int)height);
+                actualWorkers = Math.Min(configuredWorkers, boundaries.Length - 1);
 
-                parallelStatus = TryDecodeRgbaFloat32Regions(
-                    path, frameIndex, width, height, actualWorkers, outBuf, cancellation);
+                if (actualWorkers > 1)
+                {
+                    parallelStatus = TryDecodeRgbaFloat32Regions(
+                        path, frameIndex, width, height, boundaries,
+                        actualWorkers, outBuf, cancellation);
+                }
             }
 
             if (parallelStatus == IGStatus.OK || parallelStatus == IGStatus.Canceled)
@@ -293,7 +304,7 @@ internal static unsafe class WicDecode
                 if (FastJxrTrace.Enabled)
                 {
                     FastJxrTrace.Info(
-                        $"parallel {partition} path requested={configuredWorkers}, workers={actualWorkers}, size={width}x{height}, status={parallelStatus}");
+                        $"parallel {partition} path requested={configuredWorkers}, workers={actualWorkers}, size={width}x{height}, layout={(exactLayout ? "exact" : "fallback")}, status={parallelStatus}");
                 }
                 return parallelStatus;
             }
@@ -315,7 +326,8 @@ internal static unsafe class WicDecode
     /// scaling: uiWidth/uiHeight always remain the source dimensions, and only the ROI changes.
     /// </summary>
     private static IGStatus TryDecodeRgbaFloat32Regions(string path, int frameIndex,
-        uint width, uint height, int workers, IGPixelBuffer* outBuf, void* cancellation)
+        uint width, uint height, int[] boundaries, int workers,
+        IGPixelBuffer* outBuf, void* cancellation)
     {
         var srcStride64 = (long)width * 16;
         var dstStride64 = (long)width * 8;
@@ -337,7 +349,7 @@ internal static unsafe class WicDecode
             var dstStride = (int)dstStride64;
             var srcStride = (uint)srcStride64;
             var floatsPerRow = checked((int)width * 4);
-            var totalTileRows = ((int)height + 255) / 256;
+            var totalTileRows = boundaries.Length - 1;
             var failed = 0;
             var canceled = 0;
             var setupTicks = FastJxrTrace.Enabled ? new long[workers] : null;
@@ -356,8 +368,8 @@ internal static unsafe class WicDecode
 
                 var tileRowStart = totalTileRows * worker / workers;
                 var tileRowEnd = totalTileRows * (worker + 1) / workers;
-                var y0 = tileRowStart * 256;
-                var y1 = Math.Min((int)height, tileRowEnd * 256);
+                var y0 = boundaries[tileRowStart];
+                var y1 = boundaries[tileRowEnd];
                 var rows = y1 - y0;
                 if (rows <= 0) return;
 
@@ -503,7 +515,8 @@ internal static unsafe class WicDecode
     /// while exposing more parallelism for landscape images with more tile columns than rows.
     /// </summary>
     private static IGStatus TryDecodeRgbaFloat32Columns(string path, int frameIndex,
-        uint width, uint height, int workers, IGPixelBuffer* outBuf, void* cancellation)
+        uint width, uint height, int[] boundaries, int workers,
+        IGPixelBuffer* outBuf, void* cancellation)
     {
         var dstStride64 = (long)width * 8;
         var dstBytes64 = dstStride64 * height;
@@ -521,7 +534,7 @@ internal static unsafe class WicDecode
             var destBase = (nint)destPixels;
             var cancellationPtr = (nint)cancellation;
             var dstStride = (int)dstStride64;
-            var totalTileColumns = ((int)width + 255) / 256;
+            var totalTileColumns = boundaries.Length - 1;
             var failed = 0;
             var canceled = 0;
             var setupTicks = FastJxrTrace.Enabled ? new long[workers] : null;
@@ -540,8 +553,8 @@ internal static unsafe class WicDecode
 
                 var tileColumnStart = totalTileColumns * worker / workers;
                 var tileColumnEnd = totalTileColumns * (worker + 1) / workers;
-                var x0 = tileColumnStart * 256;
-                var x1 = Math.Min((int)width, tileColumnEnd * 256);
+                var x0 = boundaries[tileColumnStart];
+                var x1 = boundaries[tileColumnEnd];
                 var cols = x1 - x0;
                 if (cols <= 0) return;
 
@@ -930,6 +943,19 @@ internal static unsafe class WicDecode
             NativeMemory.Free(sourcePixels);
             NativeBuffers.Discard(destPixels);
         }
+    }
+
+
+    private static int[] BuildFallbackBoundaries(int length)
+    {
+        var bands = Math.Max(1, (length + 255) / 256);
+        var boundaries = new int[bands + 1];
+        for (var i = 0; i < bands; i++)
+        {
+            boundaries[i] = Math.Min(length, i * 256);
+        }
+        boundaries[^1] = length;
+        return boundaries;
     }
 
 
