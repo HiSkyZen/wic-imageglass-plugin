@@ -562,6 +562,49 @@ internal static unsafe class WicDecode
                         setupTicks[worker] = Stopwatch.GetTimestamp() - setupStart;
                     }
 
+                    if (GetDirectHalfEnabled() && SupportsDirectHalf(sourceTransform))
+                    {
+                        var directBytes64 = (long)(rows - 1) * dstStride + (long)cols * 8;
+                        if (directBytes64 > 0 && directBytes64 <= uint.MaxValue)
+                        {
+                            var rect = new System.Drawing.Rectangle(x0, y0, cols, rows);
+                            var requestedFormat = Apis.GUID_WICPixelFormat64bppRGBAHalf;
+                            var directDest = (byte*)(destBase
+                                + (nint)y0 * dstStride
+                                + (nint)x0 * 8);
+                            var copyStart = copyTicks is null ? 0 : Stopwatch.GetTimestamp();
+                            var directHr = sourceTransform->CopyPixels(
+                                &rect,
+                                width,
+                                height,
+                                &requestedFormat,
+                                WICBitmapTransformOptions.Rotate0,
+                                (uint)dstStride,
+                                (uint)directBytes64,
+                                directDest);
+
+                            if (copyTicks is not null)
+                            {
+                                copyTicks[worker] = Stopwatch.GetTimestamp() - copyStart;
+                            }
+
+                            if (directHr.Success
+                                && requestedFormat == Apis.GUID_WICPixelFormat64bppRGBAHalf)
+                            {
+                                if (convertTicks is not null)
+                                {
+                                    convertTicks[worker] = 0;
+                                    FastJxrTrace.Info(
+                                        $"worker-stage mode=hybrid-direct-half, worker={worker}, row={task.Row}, " +
+                                        $"columns={task.ColumnStart}-{task.ColumnEnd}, weight={task.Weight}, " +
+                                        $"setup={setupTicks![worker] * 1000.0 / Stopwatch.Frequency:F3}, " +
+                                        $"copy={copyTicks![worker] * 1000.0 / Stopwatch.Frequency:F3}, convert=0.000");
+                                }
+                                return;
+                            }
+                        }
+                    }
+
                     sourcePixels = (byte*)NativeMemory.Alloc((nuint)sourceBytes64);
                     if (sourcePixels == null)
                     {
@@ -745,6 +788,43 @@ internal static unsafe class WicDecode
                     if (setupTicks is not null)
                     {
                         setupTicks[worker] = Stopwatch.GetTimestamp() - setupStart;
+                    }
+
+                    if (GetDirectHalfEnabled() && SupportsDirectHalf(sourceTransform))
+                    {
+                        var directBytes64 = (long)dstStride * rows;
+                        if (directBytes64 > 0 && directBytes64 <= uint.MaxValue)
+                        {
+                            var rect = new System.Drawing.Rectangle(0, y0, (int)width, rows);
+                            var requestedFormat = Apis.GUID_WICPixelFormat64bppRGBAHalf;
+                            var directDest = (byte*)(destBase + (nint)y0 * dstStride);
+                            var copyStart = copyTicks is null ? 0 : Stopwatch.GetTimestamp();
+                            var directHr = sourceTransform->CopyPixels(
+                                &rect,
+                                width,
+                                height,
+                                &requestedFormat,
+                                WICBitmapTransformOptions.Rotate0,
+                                (uint)dstStride,
+                                (uint)directBytes64,
+                                directDest);
+
+                            if (copyTicks is not null)
+                            {
+                                copyTicks[worker] = Stopwatch.GetTimestamp() - copyStart;
+                            }
+
+                            if (directHr.Success
+                                && requestedFormat == Apis.GUID_WICPixelFormat64bppRGBAHalf)
+                            {
+                                if (convertTicks is not null) convertTicks[worker] = 0;
+                                if (FastJxrTrace.Enabled)
+                                {
+                                    FastJxrTrace.Info($"direct-half mode=strip, worker={worker}, rows={rows}");
+                                }
+                                return;
+                            }
+                        }
                     }
 
                     var sourceBytes64 = (long)srcStride * rows;
@@ -1327,6 +1407,25 @@ internal static unsafe class WicDecode
             $"stages mode={mode}, setup-mean={setup.Mean:F3}, setup-max={setup.Max:F3}, " +
             $"copy-mean={copy.Mean:F3}, copy-max={copy.Max:F3}, " +
             $"convert-mean={convert.Mean:F3}, convert-max={convert.Max:F3}");
+    }
+
+
+    private static bool GetDirectHalfEnabled()
+    {
+        var value = Environment.GetEnvironmentVariable("FASTJXR_DIRECT_HALF");
+        return value is not null
+            && (value == "1"
+                || value.Equals("true", StringComparison.OrdinalIgnoreCase)
+                || value.Equals("yes", StringComparison.OrdinalIgnoreCase)
+                || value.Equals("on", StringComparison.OrdinalIgnoreCase));
+    }
+
+
+    private static bool SupportsDirectHalf(IWICBitmapSourceTransform* sourceTransform)
+    {
+        var format = Apis.GUID_WICPixelFormat64bppRGBAHalf;
+        return sourceTransform->GetClosestPixelFormat(&format).Success
+            && format == Apis.GUID_WICPixelFormat64bppRGBAHalf;
     }
 
 
