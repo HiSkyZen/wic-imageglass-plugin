@@ -5,6 +5,7 @@ MIT License
 https://github.com/d2phap/wic-imageglass-plugin
 */
 using ImageGlass.SDK.Plugins;
+using System.Numerics.Tensors;
 using System.Runtime.InteropServices;
 using Vortice.Win32;
 using Vortice.Win32.Com;
@@ -306,10 +307,9 @@ internal static unsafe class WicDecode
                 var src = (float*)(srcBase + (nint)(y * srcStride));
                 var dst = (Half*)(dstBase + (nint)(y * dstStride));
 
-                for (var x = 0; x < floatsPerRow; x++)
-                {
-                    dst[x] = (Half)src[x];
-                }
+                TensorPrimitives.ConvertToHalf(
+                    new ReadOnlySpan<float>(src, floatsPerRow),
+                    new Span<Half>(dst, floatsPerRow));
             });
 
             if (HostChannel.IsCanceled(cancellation)) return IGStatus.Canceled;
