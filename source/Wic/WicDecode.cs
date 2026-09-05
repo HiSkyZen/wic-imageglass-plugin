@@ -135,7 +135,6 @@ internal static unsafe class WicDecode
 
             Guid sourceFormat;
             if (frame->GetPixelFormat(&sourceFormat).Failure) sourceFormat = default;
-            var plan = WicPixels.Choose(factory, sourceFormat);
             var orientation = ReadOrientation(frame);
 
             // The HDR files this fork is optimized for are 128bpp RGBA float JXR. WIC's
@@ -148,6 +147,8 @@ internal static unsafe class WicDecode
             {
                 return DecodeRgbaFloat32FullResolution(frame, outBuf, cancellation);
             }
+
+            var plan = WicPixels.Choose(factory, sourceFormat);
 
             // Scale, convert, then rotate. The scaler must sit on the FRAME: it reaches the
             // frame's IWICBitmapSourceTransform there (a JPEG's DCT scales), which the format
