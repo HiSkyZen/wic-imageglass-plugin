@@ -1,8 +1,8 @@
 name: Release
 
 # Manually triggered from the Actions tab. Native-AOT-publishes the plugin for both Windows
-# architectures, then creates a GitHub release with one wic-codec_<version>_<arch>.igplugin.zip
-# per architecture attached. Each package holds a "Plugin_WicCodec" folder, which both
+# architectures, then creates a GitHub release with one fast-jxr-hdr_<version>_<arch>.igplugin.zip
+# per architecture attached. Each package holds a "Plugin_FastJxrHdrCodec" folder, which both
 # Settings > Plugins > Add and a manual copy into the _plugins directory accept.
 #
 # Windows only, by definition: the Windows Imaging Component is a Windows API.
@@ -28,7 +28,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  PLUGIN_FOLDER: Plugin_WicCodec
+  PLUGIN_FOLDER: Plugin_FastJxrHdrCodec
 
 jobs:
   build:
@@ -102,15 +102,15 @@ jobs:
             }
           }
 
-      - name: Pack wic-codec_${{ inputs.version }}_${{ matrix.arch }}.igplugin.zip
+      - name: Pack fast-jxr-hdr_${{ inputs.version }}_${{ matrix.arch }}.igplugin.zip
         shell: pwsh
-        run: Compress-Archive -Path "staging/$env:PLUGIN_FOLDER" -DestinationPath "wic-codec_${{ inputs.version }}_${{ matrix.arch }}.igplugin.zip"
+        run: Compress-Archive -Path "staging/$env:PLUGIN_FOLDER" -DestinationPath "fast-jxr-hdr_${{ inputs.version }}_${{ matrix.arch }}.igplugin.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: wic-codec_${{ matrix.arch }}
-          path: wic-codec_${{ inputs.version }}_${{ matrix.arch }}.igplugin.zip
+          name: fast-jxr-hdr_${{ matrix.arch }}
+          path: fast-jxr-hdr_${{ inputs.version }}_${{ matrix.arch }}.igplugin.zip
           if-no-files-found: error
           retention-days: 7
 
