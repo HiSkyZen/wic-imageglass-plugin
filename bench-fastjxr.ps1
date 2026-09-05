@@ -9,7 +9,7 @@
 
     By default the script:
       1. performs one ignored 8-worker warm-up;
-      2. tests one-shot horizontal strip and vertical column partitioning across multiple worker counts;
+      2. tests exact-row strip and weighted one-shot hybrid partitioning across multiple worker counts;
       3. runs three measured repetitions;
       4. alternates ascending/descending worker order to reduce ordering bias;
       5. writes raw.csv, summary.csv and the individual plugin trace logs.
@@ -54,8 +54,8 @@ param(
     [ValidateRange(1, 64)]
     [int[]] $Workers = @(1, 2, 4, 8, 12, 16, 20, 24, 32, 48),
 
-    [ValidateSet('strip', 'column', 'grid')]
-    [string[]] $Partitions = @('strip', 'column'),
+    [ValidateSet('strip', 'hybrid', 'column', 'grid')]
+    [string[]] $Partitions = @('strip', 'hybrid'),
 
     [ValidateRange(1, 20)]
     [int] $Repeats = 3,
@@ -158,7 +158,7 @@ function Parse-TraceFile {
     $actualWorkers = 1
 
     foreach ($line in $lines) {
-        if ($line -match '\tevent=info\tmessage=parallel (strip|column|grid) path requested=([0-9]+), workers=([0-9]+),') {
+        if ($line -match '\tevent=info\tmessage=parallel (strip|hybrid|column|grid) path requested=([0-9]+), workers=([0-9]+),') {
             $partition = $matches[1]
             $actualWorkers = [int]$matches[3]
             $route = "parallel-$partition"
