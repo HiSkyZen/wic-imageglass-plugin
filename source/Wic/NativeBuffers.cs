@@ -13,10 +13,11 @@ namespace WicCodec.Wic;
 /// </summary>
 internal static unsafe class NativeBuffers
 {
-    // Buffers currently owned by the host. Remove-before-free makes a double free a no-op,
-    // and refuses a pointer the plugin never handed out (e.g. a host-owned encode buffer).
+    // Reference counts for plugin pixel buffers. A decoded image can be retained by the
+    // full-resolution cache while ImageGlass/Skia owns another reference to the exact same
+    // immutable pixels. Unknown pointers are still refused (e.g. host-owned encode buffers).
     private static readonly Lock _lock = new();
-    private static readonly HashSet<nint> _live = [];
+    private static readonly Dictionary<nint, int> _live = [];
 
     // The host reads IGImageInfo.IccProfileData AFTER LoadMetadata returns, so profiles go
     // into a small process-lifetime ring instead of being freed on the way out.
@@ -32,7 +33,7 @@ internal static unsafe class NativeBuffers
         var block = (byte*)NativeMemory.Alloc(byteCount);
         lock (_lock)
         {
-            _live.Add((nint)block);
+            _live[(nint)block] = 1;
         }
         return block;
     }
@@ -42,16 +43,47 @@ internal static unsafe class NativeBuffers
     /// Frees a buffer allocated by <see cref="AllocPixels"/>, but only once and only if it
     /// really came from here. Callable from any thread, including the GC finalizer thread.
     /// </summary>
-    public static bool FreePixels(void* block)
+    public static bool RetainPixels(void* block)
     {
         if (block == null) return false;
 
         lock (_lock)
         {
-            if (!_live.Remove((nint)block)) return false;
+            var key = (nint)block;
+            if (!_live.TryGetValue(key, out var refs) || refs <= 0) return false;
+            if (refs == int.MaxValue) return false;
+            _live[key] = refs + 1;
+            return true;
+        }
+    }
+
+
+    /// <summary>
+    /// Releases one reference to a plugin pixel buffer. The native allocation is freed only
+    /// after both the host and any decode-cache entries have released their references.
+    /// </summary>
+    public static bool FreePixels(void* block)
+    {
+        if (block == null) return false;
+
+        var free = false;
+        lock (_lock)
+        {
+            var key = (nint)block;
+            if (!_live.TryGetValue(key, out var refs) || refs <= 0) return false;
+
+            if (refs == 1)
+            {
+                _live.Remove(key);
+                free = true;
+            }
+            else
+            {
+                _live[key] = refs - 1;
+            }
         }
 
-        NativeMemory.Free(block);
+        if (free) NativeMemory.Free(block);
         return true;
     }
 
@@ -62,12 +94,7 @@ internal static unsafe class NativeBuffers
     public static void Discard(void* block)
     {
         if (block == null) return;
-
-        lock (_lock)
-        {
-            _live.Remove((nint)block);
-        }
-        NativeMemory.Free(block);
+        FreePixels(block);
     }
 
 
