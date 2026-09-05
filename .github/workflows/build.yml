@@ -18,6 +18,21 @@ jobs:
         with:
           dotnet-version: "10.0.x"
 
+      - name: Validate benchmark script syntax
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path "bench-fastjxr.ps1"),
+            [ref]$tokens,
+            [ref]$errors
+          ) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | Format-List *
+            throw "bench-fastjxr.ps1 has PowerShell syntax errors"
+          }
+
       - name: Restore
         run: dotnet restore source/WicCodec.csproj -r win-x64
 
