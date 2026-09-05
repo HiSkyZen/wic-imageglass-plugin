@@ -254,22 +254,43 @@ internal static unsafe class WicDecode
             return IGStatus.DecodeFailed;
         }
 
-        var workers = GetRegionWorkerCount((int)height);
-        if (workers > 1)
+        var configuredWorkers = GetConfiguredWorkerCount();
+        if (configuredWorkers > 1)
         {
-            var parallelStatus = TryDecodeRgbaFloat32Regions(
-                path, frameIndex, width, height, workers, outBuf, cancellation);
+            var partition = GetPartitionMode();
+            var parallelStatus = IGStatus.Unsupported;
+            var actualWorkers = 1;
+
+            if (partition == "grid")
+            {
+                var tileColumns = ((int)width + 255) / 256;
+                var tileRows = ((int)height + 255) / 256;
+                actualWorkers = Math.Min(configuredWorkers, checked(tileColumns * tileRows));
+
+                parallelStatus = TryDecodeRgbaFloat32TileGrid(
+                    path, frameIndex, width, height, actualWorkers, outBuf, cancellation);
+            }
+            else
+            {
+                var tileRows = Math.Max(1, ((int)height + 255) / 256);
+                actualWorkers = Math.Min(configuredWorkers, tileRows);
+
+                parallelStatus = TryDecodeRgbaFloat32Regions(
+                    path, frameIndex, width, height, actualWorkers, outBuf, cancellation);
+            }
 
             if (parallelStatus == IGStatus.OK || parallelStatus == IGStatus.Canceled)
             {
                 if (FastJxrTrace.Enabled)
                 {
-                    FastJxrTrace.Info($"parallel ROI path workers={workers}, size={width}x{height}, status={parallelStatus}");
+                    FastJxrTrace.Info(
+                        $"parallel {partition} path requested={configuredWorkers}, workers={actualWorkers}, size={width}x{height}, status={parallelStatus}");
                 }
                 return parallelStatus;
             }
 
-            HostChannel.Log(3, $"FastJXR: parallel ROI decode fell back to single decoder ({parallelStatus}).");
+            HostChannel.Log(3,
+                $"FastJXR: parallel {partition} decode fell back to single decoder ({parallelStatus}).");
         }
 
         if (FastJxrTrace.Enabled)
@@ -446,6 +467,176 @@ internal static unsafe class WicDecode
 
 
     /// <summary>
+    /// Experimental full-resolution 2D JPEG XR tile scheduler. Each worker owns one independent
+    /// WIC decoder and repeatedly claims 256x256 ROIs from a shared work queue. This allows images
+    /// with fewer tile rows than CPU threads to exploit horizontal tile parallelism as well.
+    /// No reduced-resolution decode is requested: uiWidth/uiHeight stay at source dimensions.
+    /// </summary>
+    private static IGStatus TryDecodeRgbaFloat32TileGrid(string path, int frameIndex,
+        uint width, uint height, int workers, IGPixelBuffer* outBuf, void* cancellation)
+    {
+        var dstStride64 = (long)width * 8;
+        var dstBytes64 = dstStride64 * height;
+        if (dstStride64 <= 0 || dstStride64 > int.MaxValue || dstBytes64 > int.MaxValue)
+        {
+            return IGStatus.OutOfMemory;
+        }
+
+        var tileColumns = ((int)width + 255) / 256;
+        var tileRows = ((int)height + 255) / 256;
+        var totalTiles = checked(tileColumns * tileRows);
+        workers = Math.Clamp(workers, 1, totalTiles);
+
+        byte* destPixels = null;
+        try
+        {
+            destPixels = NativeBuffers.AllocPixels((nuint)dstBytes64);
+            if (destPixels == null) return IGStatus.OutOfMemory;
+
+            var destBase = (nint)destPixels;
+            var cancellationPtr = (nint)cancellation;
+            var dstStride = (int)dstStride64;
+            var failed = 0;
+            var canceled = 0;
+            var nextTile = -1;
+
+            var options = new ParallelOptions { MaxDegreeOfParallelism = workers };
+            Parallel.For(0, workers, options, _ =>
+            {
+                if (Volatile.Read(ref failed) != 0 || Volatile.Read(ref canceled) != 0) return;
+
+                IWICImagingFactory* workerFactory = null;
+                IWICBitmapDecoder* workerDecoder = null;
+                IWICBitmapFrameDecode* workerFrame = null;
+                IWICBitmapSourceTransform* sourceTransform = null;
+                byte* sourcePixels = null;
+
+                try
+                {
+                    var openStatus = Open(path, (void*)cancellationPtr, ref workerFactory, ref workerDecoder);
+                    if (openStatus != IGStatus.OK)
+                    {
+                        Interlocked.CompareExchange(ref failed, (int)openStatus, 0);
+                        return;
+                    }
+
+                    if (workerDecoder->GetFrame((uint)frameIndex, &workerFrame).Failure)
+                    {
+                        Interlocked.CompareExchange(ref failed, (int)IGStatus.DecodeFailed, 0);
+                        return;
+                    }
+
+                    Guid sourceFormat;
+                    if (workerFrame->GetPixelFormat(&sourceFormat).Failure
+                        || sourceFormat != Apis.GUID_WICPixelFormat128bppRGBAFloat)
+                    {
+                        Interlocked.CompareExchange(ref failed, (int)IGStatus.Unsupported, 0);
+                        return;
+                    }
+
+                    var transformIid = IWICBitmapSourceTransform.IID_IWICBitmapSourceTransform;
+                    if (workerFrame->QueryInterface(&transformIid, (void**)&sourceTransform).Failure)
+                    {
+                        Interlocked.CompareExchange(ref failed, (int)IGStatus.Unsupported, 0);
+                        return;
+                    }
+
+                    // Maximum temporary for one 256x256 RGBA32F tile = 1 MiB per worker.
+                    const nuint MaxTileBytes = 256u * 256u * 16u;
+                    sourcePixels = (byte*)NativeMemory.Alloc(MaxTileBytes);
+                    if (sourcePixels == null)
+                    {
+                        Interlocked.CompareExchange(ref failed, (int)IGStatus.OutOfMemory, 0);
+                        return;
+                    }
+
+                    while (Volatile.Read(ref failed) == 0 && Volatile.Read(ref canceled) == 0)
+                    {
+                        var tileIndex = Interlocked.Increment(ref nextTile);
+                        if (tileIndex >= totalTiles) break;
+
+                        if (HostChannel.IsCanceled((void*)cancellationPtr))
+                        {
+                            Interlocked.Exchange(ref canceled, 1);
+                            break;
+                        }
+
+                        var tileX = tileIndex % tileColumns;
+                        var tileY = tileIndex / tileColumns;
+                        var x0 = tileX * 256;
+                        var y0 = tileY * 256;
+                        var cols = Math.Min(256, (int)width - x0);
+                        var rows = Math.Min(256, (int)height - y0);
+                        var srcStride = checked((uint)(cols * 16));
+                        var sourceBytes = checked(srcStride * (uint)rows);
+
+                        var rect = new System.Drawing.Rectangle(x0, y0, cols, rows);
+                        var requestedFormat = Apis.GUID_WICPixelFormat128bppRGBAFloat;
+                        var hr = sourceTransform->CopyPixels(
+                            &rect,
+                            width,
+                            height,
+                            &requestedFormat,
+                            WICBitmapTransformOptions.Rotate0,
+                            srcStride,
+                            sourceBytes,
+                            sourcePixels);
+
+                        if (hr.Failure || requestedFormat != Apis.GUID_WICPixelFormat128bppRGBAFloat)
+                        {
+                            Interlocked.CompareExchange(ref failed, (int)IGStatus.DecodeFailed, 0);
+                            break;
+                        }
+
+                        var floatsPerRow = cols * 4;
+                        for (var row = 0; row < rows; row++)
+                        {
+                            var src = (float*)(sourcePixels + (nint)row * srcStride);
+                            var dst = (Half*)(destBase
+                                + (nint)(y0 + row) * dstStride
+                                + (nint)x0 * 8);
+
+                            TensorPrimitives.ConvertToHalf(
+                                new ReadOnlySpan<float>(src, floatsPerRow),
+                                new Span<Half>(dst, floatsPerRow));
+                        }
+                    }
+                }
+                catch
+                {
+                    Interlocked.CompareExchange(ref failed, (int)IGStatus.Internal, 0);
+                }
+                finally
+                {
+                    NativeMemory.Free(sourcePixels);
+                    ComInterop.Release(ref sourceTransform);
+                    ComInterop.Release(ref workerFrame);
+                    ComInterop.Release(ref workerDecoder);
+                    ComInterop.Release(ref workerFactory);
+                }
+            });
+
+            if (Volatile.Read(ref canceled) != 0) return IGStatus.Canceled;
+            var failure = Volatile.Read(ref failed);
+            if (failure != 0) return (IGStatus)failure;
+
+            outBuf->Data = destPixels;
+            outBuf->Width = (int)width;
+            outBuf->Height = (int)height;
+            outBuf->Stride = dstStride;
+            outBuf->PixelFormat = (int)IGPixelFormat.RgbaFloat16;
+            outBuf->ReleaseContext = destPixels;
+            destPixels = null;
+            return IGStatus.OK;
+        }
+        finally
+        {
+            NativeBuffers.Discard(destPixels);
+        }
+    }
+
+
+    /// <summary>
     /// Conservative single-decoder full-resolution fallback. WIC emits native RGBA32F once and
     /// the narrowing pass is then vectorized and spread across all logical processors.
     /// </summary>
@@ -521,19 +712,29 @@ internal static unsafe class WicDecode
     }
 
 
-    private static int GetRegionWorkerCount(int height)
+    private static int GetConfiguredWorkerCount()
     {
-        var tileRows = Math.Max(1, (height + 255) / 256);
-        var defaultWorkers = Math.Clamp(Environment.ProcessorCount / 2, 1, 8);
-
-        var configured = defaultWorkers;
+        // This fork is explicitly latency-oriented: use all logical processors by default.
+        // The environment override is intentionally allowed above the machine thread count for
+        // experiments with WIC I/O/decode overlap, but practical scaling is usually bounded by
+        // the number of JPEG XR tiles and memory bandwidth.
+        var configured = Math.Clamp(Environment.ProcessorCount, 1, 64);
         var text = Environment.GetEnvironmentVariable("FASTJXR_WORKERS");
         if (int.TryParse(text, out var parsed))
         {
-            configured = Math.Clamp(parsed, 1, 16);
+            configured = Math.Clamp(parsed, 1, 64);
         }
 
-        return Math.Min(configured, tileRows);
+        return configured;
+    }
+
+
+    private static string GetPartitionMode()
+    {
+        var mode = Environment.GetEnvironmentVariable("FASTJXR_PARTITION");
+        return string.Equals(mode, "grid", StringComparison.OrdinalIgnoreCase)
+            ? "grid"
+            : "strip";
     }
 
 
