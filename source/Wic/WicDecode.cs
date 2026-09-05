@@ -5,6 +5,7 @@ MIT License
 https://github.com/d2phap/wic-imageglass-plugin
 */
 using ImageGlass.SDK.Plugins;
+using System.Diagnostics;
 using System.Numerics.Tensors;
 using System.Runtime.InteropServices;
 using Vortice.Win32;
@@ -339,6 +340,9 @@ internal static unsafe class WicDecode
             var totalTileRows = ((int)height + 255) / 256;
             var failed = 0;
             var canceled = 0;
+            var setupTicks = FastJxrTrace.Enabled ? new long[workers] : null;
+            var copyTicks = FastJxrTrace.Enabled ? new long[workers] : null;
+            var convertTicks = FastJxrTrace.Enabled ? new long[workers] : null;
 
             var options = new ParallelOptions { MaxDegreeOfParallelism = workers };
             Parallel.For(0, workers, options, worker =>
@@ -365,6 +369,7 @@ internal static unsafe class WicDecode
 
                 try
                 {
+                    var setupStart = setupTicks is null ? 0 : Stopwatch.GetTimestamp();
                     var openStatus = Open(path, (void*)cancellationPtr, ref workerFactory, ref workerDecoder);
                     if (openStatus != IGStatus.OK)
                     {
@@ -393,6 +398,11 @@ internal static unsafe class WicDecode
                         return;
                     }
 
+                    if (setupTicks is not null)
+                    {
+                        setupTicks[worker] = Stopwatch.GetTimestamp() - setupStart;
+                    }
+
                     var sourceBytes64 = (long)srcStride * rows;
                     if (sourceBytes64 <= 0 || sourceBytes64 > uint.MaxValue)
                     {
@@ -409,6 +419,7 @@ internal static unsafe class WicDecode
 
                     var rect = new System.Drawing.Rectangle(0, y0, (int)width, rows);
                     var requestedFormat = Apis.GUID_WICPixelFormat128bppRGBAFloat;
+                    var copyStart = copyTicks is null ? 0 : Stopwatch.GetTimestamp();
                     var hr = sourceTransform->CopyPixels(
                         &rect,
                         width,
@@ -419,12 +430,18 @@ internal static unsafe class WicDecode
                         (uint)sourceBytes64,
                         sourcePixels);
 
+                    if (copyTicks is not null)
+                    {
+                        copyTicks[worker] = Stopwatch.GetTimestamp() - copyStart;
+                    }
+
                     if (hr.Failure || requestedFormat != Apis.GUID_WICPixelFormat128bppRGBAFloat)
                     {
                         Interlocked.CompareExchange(ref failed, (int)IGStatus.DecodeFailed, 0);
                         return;
                     }
 
+                    var convertStart = convertTicks is null ? 0 : Stopwatch.GetTimestamp();
                     for (var row = 0; row < rows; row++)
                     {
                         if ((row & 31) == 0 && HostChannel.IsCanceled((void*)cancellationPtr))
@@ -438,6 +455,10 @@ internal static unsafe class WicDecode
                         TensorPrimitives.ConvertToHalf(
                             new ReadOnlySpan<float>(src, floatsPerRow),
                             new Span<Half>(dst, floatsPerRow));
+                    }
+                    if (convertTicks is not null)
+                    {
+                        convertTicks[worker] = Stopwatch.GetTimestamp() - convertStart;
                     }
                 }
                 catch
@@ -453,6 +474,8 @@ internal static unsafe class WicDecode
                     ComInterop.Release(ref workerFactory);
                 }
             });
+
+            TraceParallelStages("strip", setupTicks, copyTicks, convertTicks);
 
             if (Volatile.Read(ref canceled) != 0) return IGStatus.Canceled;
             var failure = Volatile.Read(ref failed);
@@ -501,6 +524,9 @@ internal static unsafe class WicDecode
             var totalTileColumns = ((int)width + 255) / 256;
             var failed = 0;
             var canceled = 0;
+            var setupTicks = FastJxrTrace.Enabled ? new long[workers] : null;
+            var copyTicks = FastJxrTrace.Enabled ? new long[workers] : null;
+            var convertTicks = FastJxrTrace.Enabled ? new long[workers] : null;
 
             var options = new ParallelOptions { MaxDegreeOfParallelism = workers };
             Parallel.For(0, workers, options, worker =>
@@ -539,6 +565,7 @@ internal static unsafe class WicDecode
 
                 try
                 {
+                    var setupStart = setupTicks is null ? 0 : Stopwatch.GetTimestamp();
                     var openStatus = Open(path, (void*)cancellationPtr, ref workerFactory, ref workerDecoder);
                     if (openStatus != IGStatus.OK)
                     {
@@ -567,6 +594,11 @@ internal static unsafe class WicDecode
                         return;
                     }
 
+                    if (setupTicks is not null)
+                    {
+                        setupTicks[worker] = Stopwatch.GetTimestamp() - setupStart;
+                    }
+
                     sourcePixels = (byte*)NativeMemory.Alloc((nuint)sourceBytes64);
                     if (sourcePixels == null)
                     {
@@ -576,6 +608,7 @@ internal static unsafe class WicDecode
 
                     var rect = new System.Drawing.Rectangle(x0, 0, cols, (int)height);
                     var requestedFormat = Apis.GUID_WICPixelFormat128bppRGBAFloat;
+                    var copyStart = copyTicks is null ? 0 : Stopwatch.GetTimestamp();
                     var hr = sourceTransform->CopyPixels(
                         &rect,
                         width,
@@ -586,12 +619,18 @@ internal static unsafe class WicDecode
                         (uint)sourceBytes64,
                         sourcePixels);
 
+                    if (copyTicks is not null)
+                    {
+                        copyTicks[worker] = Stopwatch.GetTimestamp() - copyStart;
+                    }
+
                     if (hr.Failure || requestedFormat != Apis.GUID_WICPixelFormat128bppRGBAFloat)
                     {
                         Interlocked.CompareExchange(ref failed, (int)IGStatus.DecodeFailed, 0);
                         return;
                     }
 
+                    var convertStart = convertTicks is null ? 0 : Stopwatch.GetTimestamp();
                     for (var row = 0; row < (int)height; row++)
                     {
                         if ((row & 31) == 0 && HostChannel.IsCanceled((void*)cancellationPtr))
@@ -607,6 +646,10 @@ internal static unsafe class WicDecode
                             new ReadOnlySpan<float>(src, floatsPerRow),
                             new Span<Half>(dst, floatsPerRow));
                     }
+                    if (convertTicks is not null)
+                    {
+                        convertTicks[worker] = Stopwatch.GetTimestamp() - convertStart;
+                    }
                 }
                 catch
                 {
@@ -621,6 +664,8 @@ internal static unsafe class WicDecode
                     ComInterop.Release(ref workerFactory);
                 }
             });
+
+            TraceParallelStages("column", setupTicks, copyTicks, convertTicks);
 
             if (Volatile.Read(ref canceled) != 0) return IGStatus.Canceled;
             var failure = Volatile.Read(ref failed);
@@ -885,6 +930,45 @@ internal static unsafe class WicDecode
             NativeMemory.Free(sourcePixels);
             NativeBuffers.Discard(destPixels);
         }
+    }
+
+
+    private static void TraceParallelStages(string mode, long[]? setupTicks,
+        long[]? copyTicks, long[]? convertTicks)
+    {
+        if (!FastJxrTrace.Enabled || setupTicks is null || copyTicks is null || convertTicks is null)
+        {
+            return;
+        }
+
+        static (double Mean, double Max) Stats(long[] values)
+        {
+            long sum = 0;
+            long max = 0;
+            var count = 0;
+
+            foreach (var value in values)
+            {
+                if (value <= 0) continue;
+                sum += value;
+                if (value > max) max = value;
+                count++;
+            }
+
+            if (count == 0) return (0, 0);
+
+            var scale = 1000.0 / Stopwatch.Frequency;
+            return ((sum / (double)count) * scale, max * scale);
+        }
+
+        var setup = Stats(setupTicks);
+        var copy = Stats(copyTicks);
+        var convert = Stats(convertTicks);
+
+        FastJxrTrace.Info(
+            $"stages mode={mode}, setup-mean={setup.Mean:F3}, setup-max={setup.Max:F3}, " +
+            $"copy-mean={copy.Mean:F3}, copy-max={copy.Max:F3}, " +
+            $"convert-mean={convert.Mean:F3}, convert-max={convert.Max:F3}");
     }
 
 
