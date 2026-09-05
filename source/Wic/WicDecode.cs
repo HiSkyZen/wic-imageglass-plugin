@@ -544,24 +544,73 @@ internal static unsafe class WicDecode
         factory = WicFactory.Create();
         if (factory == null) return IGStatus.Internal;
 
+        // This fork only claims JPEG XR, so avoid WIC's filename/content sniff and registered
+        // decoder search on the hot path. This matters especially for parallel ROI decoding,
+        // where several decoder instances are opened for one image.
+        IWICStream* stream = null;
         IWICBitmapDecoder* opened = null;
-        HResult hr;
-        fixed (char* pPath = path)
+        try
         {
-            hr = factory->CreateDecoderFromFilename(pPath, null, NativeFileAccess.GenericRead,
-                Apis.WICDecodeMetadataCacheOnDemand, &opened);
-        }
+            var directHr = factory->CreateStream(&stream);
+            if (directHr.Success)
+            {
+                fixed (char* pPath = path)
+                {
+                    directHr = stream->InitializeFromFilename(pPath, ComInterop.GENERIC_READ);
+                }
+            }
 
-        if (hr.Failure)
+            if (directHr.Success)
+            {
+                var container = Apis.GUID_ContainerFormatWmp;
+                directHr = factory->CreateDecoder(&container, null, &opened);
+            }
+
+            if (directHr.Success)
+            {
+                directHr = opened->Initialize(
+                    (Vortice.Win32.Com.IStream*)stream,
+                    Apis.WICDecodeMetadataCacheOnDemand);
+            }
+
+            if (directHr.Success)
+            {
+                decoder = opened;
+                opened = null;
+                return IGStatus.OK;
+            }
+
+            // Compatibility fallback: if a system's explicit WMP decoder cannot be initialized,
+            // let WIC sniff the file and select any registered JPEG XR decoder.
+            ComInterop.Release(ref opened);
+            ComInterop.Release(ref stream);
+
+            fixed (char* pPath = path)
+            {
+                directHr = factory->CreateDecoderFromFilename(
+                    pPath,
+                    null,
+                    NativeFileAccess.GenericRead,
+                    Apis.WICDecodeMetadataCacheOnDemand,
+                    &opened);
+            }
+
+            if (directHr.Failure)
+            {
+                return directHr.Value == ComInterop.WINCODEC_ERR_COMPONENTNOTFOUND
+                    ? IGStatus.Unsupported
+                    : IGStatus.IoError;
+            }
+
+            decoder = opened;
+            opened = null;
+            return IGStatus.OK;
+        }
+        finally
         {
-            // No installed codec recognized the bytes; let the host try its built-ins.
-            return hr.Value == ComInterop.WINCODEC_ERR_COMPONENTNOTFOUND
-                ? IGStatus.Unsupported
-                : IGStatus.IoError;
+            ComInterop.Release(ref opened);
+            ComInterop.Release(ref stream);
         }
-
-        decoder = opened;
-        return IGStatus.OK;
     }
 
 
