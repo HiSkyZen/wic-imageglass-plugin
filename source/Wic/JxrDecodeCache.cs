@@ -119,6 +119,19 @@ internal static unsafe class JxrDecodeCache
         }
     }
 
+    public static void Clear()
+    {
+        lock (_lock)
+        {
+            for (var i = _entries.Count - 1; i >= 0; i--)
+            {
+                RemoveAt(i);
+            }
+            _residentBytes = 0;
+        }
+    }
+
+
     private static void RemoveAt(int index)
     {
         var entry = _entries[index];
