@@ -17,11 +17,11 @@ internal static unsafe class WicCodecPlugin
     // Everything the host receives must outlive the call. The API tables, id strings and the
     // extension tables are process-lifetime native blocks that are intentionally never freed.
 
-    private const string PluginIdString = "Plugin_WicCodec";
-    private const string PluginNameString = "WIC Codec";
-    private const string VersionString = "1.2.0";
-    private const string CodecIdString = "plugin.wic.codec";
-    private const string CodecNameString = "WIC Codec";
+    private const string PluginIdString = "Plugin_FastJxrHdrCodec";
+    private const string PluginNameString = "Fast JXR HDR Codec";
+    private const string VersionString = "1.3.0-dev";
+    private const string CodecIdString = "plugin.fastjxr.hdr.codec";
+    private const string CodecNameString = "Fast JXR HDR Codec";
 
     // Above SkiaSharp (100) and Magick.NET (10/100) for every extension WIC claims. Enabling a
     // plugin is an explicit act of trust, so the host honors this verbatim; the per-extension
@@ -31,6 +31,8 @@ internal static unsafe class WicCodecPlugin
     // IGHdrTransferFn.ScRgb arrived in ABI minor 1; an older host maps the unknown value to None
     // and skips tone mapping entirely, which blows out every extended-range image.
     private const int ScRgbHostAbiVersion = 1_001_000;
+
+    private static readonly string[] JxrExtensions = [".jxr", ".wdp", ".hdp"];
 
     private static IGPluginApi* _pluginApi;
     private static IGCodecApi* _codecApi;
@@ -56,7 +58,6 @@ internal static unsafe class WicCodecPlugin
 
         try
         {
-            WicFormats.Discover();
             InitCapability();
             InitCodecApi();
             InitPluginApi();
@@ -110,7 +111,7 @@ internal static unsafe class WicCodecPlugin
         if (ext.Data == null || ext.Length <= 0) return 0;
 
         var value = new ReadOnlySpan<char>(ext.Data, ext.Length);
-        foreach (var supported in WicFormats.DecodeExtensions)
+        foreach (var supported in JxrExtensions)
         {
             if (value.Equals(supported, StringComparison.OrdinalIgnoreCase)) return 1;
         }
@@ -171,7 +172,8 @@ internal static unsafe class WicCodecPlugin
         try
         {
             if (!TryGetPath(filePath, out var path)) return IGStatus.InvalidArg;
-            return WicDecode.DecodeScaled(path, frameIndex, maxWidth, maxHeight, outBuf, cancellation);
+            // Full-resolution is intentional: this fork never asks WIC/JPEG XR for a reduced-resolution decode.
+            return WicDecode.Decode(path, frameIndex, outBuf, cancellation);
         }
         catch (OutOfMemoryException)
         {
@@ -272,9 +274,6 @@ internal static unsafe class WicCodecPlugin
 
     private static void InitCapability()
     {
-        var decodeExtensions = WicFormats.DecodeExtensions;
-        var encodeExtensions = WicFormats.EncodeExtensions;
-
         _capability = (IGCodecCapability*)NativeMemory.AllocZeroed((nuint)sizeof(IGCodecCapability));
         _capability->StructSize = sizeof(IGCodecCapability);
         _capability->CodecId = MakeStringRef(CodecIdString);
@@ -282,26 +281,20 @@ internal static unsafe class WicCodecPlugin
 
         _capability->MetadataPriority = Priority;
         _capability->DecodePriority = Priority;
-        _capability->EncodePriority = Priority;
+        _capability->EncodePriority = 0;
 
         _capability->SupportsMetadata = 1;
         _capability->SupportsColorProfiles = 1;
+        _capability->SupportsStaticRasterDecoding = 1;
+        _capability->DecodeExtensionCount = JxrExtensions.Length;
+        _capability->DecodeExtensions = MakeStringRefArray(JxrExtensions);
 
-        // An empty list is the host's catch-all convention, so a codec that discovered nothing
-        // must claim nothing rather than claim everything.
-        _capability->SupportsStaticRasterDecoding = decodeExtensions.Length > 0 ? 1 : 0;
-        _capability->DecodeExtensionCount = decodeExtensions.Length;
-        _capability->DecodeExtensions = MakeStringRefArray(decodeExtensions);
-
-        // WIC exposes multi-frame files as a page container with no timeline, which is what
-        // FrameCount > 1 without SupportsAnimationDecoding means to the host: the frame
-        // navigator steps through them and DecodeStaticRaster serves each one.
+        // JPEG XR is treated as a single-frame still image in this performance-focused fork.
         _capability->SupportsAnimationDecoding = 0;
-
-        _capability->SupportsStaticRasterEncoding = encodeExtensions.Length > 0 ? 1 : 0;
-        _capability->SupportsMultiFrameEncoding = encodeExtensions.Length > 0 ? 1 : 0;
-        _capability->EncodeExtensionCount = encodeExtensions.Length;
-        _capability->EncodeExtensions = MakeStringRefArray(encodeExtensions);
+        _capability->SupportsStaticRasterEncoding = 0;
+        _capability->SupportsMultiFrameEncoding = 0;
+        _capability->EncodeExtensionCount = 0;
+        _capability->EncodeExtensions = null;
     }
 
 
@@ -325,10 +318,10 @@ internal static unsafe class WicCodecPlugin
         _codecApi->FreeAnimationInfo = null;
         _codecApi->DecodeAnimationFrame = null;
 
-        _codecApi->EncodeStaticRaster = &CodecEncodeStaticRaster;
-        _codecApi->BeginEncodeMultiFrame = &CodecBeginEncodeMultiFrame;
-        _codecApi->EncodeFrame = &CodecEncodeFrame;
-        _codecApi->EndEncodeMultiFrame = &CodecEndEncodeMultiFrame;
+        _codecApi->EncodeStaticRaster = null;
+        _codecApi->BeginEncodeMultiFrame = null;
+        _codecApi->EncodeFrame = null;
+        _codecApi->EndEncodeMultiFrame = null;
     }
 
 
