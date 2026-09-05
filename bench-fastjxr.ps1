@@ -25,6 +25,10 @@
 .PARAMETER Workers
     Requested worker counts to test. Default: 1,2,4,8,12,16,20,24,32,48.
 
+.PARAMETER DirectHalf
+    Ask IWICBitmapSourceTransform for native RGBAHalf output. Unsupported decoders fall back
+    automatically to the proven RGBA32F + TensorPrimitives conversion path.
+
 .PARAMETER Repeats
     Number of measured repetitions per worker count. Default: 3.
 
@@ -56,6 +60,8 @@ param(
 
     [ValidateSet('strip', 'hybrid', 'column', 'grid')]
     [string[]] $Partitions = @('strip', 'hybrid'),
+
+    [switch] $DirectHalf,
 
     [ValidateRange(1, 20)]
     [int] $Repeats = 3,
@@ -176,7 +182,7 @@ function Parse-TraceFile {
     $convertMaxMs = [double]::NaN
 
     foreach ($line in $lines) {
-        if ($line -match '\tevent=info\tmessage=stages mode=(strip|column), setup-mean=([0-9.]+), setup-max=([0-9.]+), copy-mean=([0-9.]+), copy-max=([0-9.]+), convert-mean=([0-9.]+), convert-max=([0-9.]+)') {
+        if ($line -match '\tevent=info\tmessage=stages mode=(strip|hybrid|column), setup-mean=([0-9.]+), setup-max=([0-9.]+), copy-mean=([0-9.]+), copy-max=([0-9.]+), convert-mean=([0-9.]+), convert-max=([0-9.]+)') {
             $setupMaxMs = [double]::Parse($matches[3], [Globalization.CultureInfo]::InvariantCulture)
             $copyMaxMs = [double]::Parse($matches[5], [Globalization.CultureInfo]::InvariantCulture)
             $convertMaxMs = [double]::Parse($matches[7], [Globalization.CultureInfo]::InvariantCulture)
@@ -306,18 +312,27 @@ New-Item -ItemType Directory -Force -Path $OutputDirectory | Out-Null
 # Save and restore the caller's environment.
 $oldWorkers = $env:FASTJXR_WORKERS
 $oldPartition = $env:FASTJXR_PARTITION
+$oldDirectHalf = $env:FASTJXR_DIRECT_HALF
 $oldTrace = $env:FASTJXR_TRACE
 $oldTraceFile = $env:FASTJXR_TRACE_FILE
 
 $results = New-Object System.Collections.Generic.List[object]
 
 try {
+    if ($DirectHalf) {
+        $env:FASTJXR_DIRECT_HALF = '1'
+    }
+    else {
+        $env:FASTJXR_DIRECT_HALF = $null
+    }
+
     Write-Host ""
     Write-Host "Fast JXR full-resolution benchmark" -ForegroundColor Cyan
     Write-Host "  Image:       $JxrPathResolved"
     Write-Host "  ImageGlass:  $ImageGlassExeResolved"
     Write-Host "  Workers:     $($Workers -join ', ')"
     Write-Host "  Partitions:  $($Partitions -join ', ')"
+    Write-Host "  DirectHalf:  $([bool]$DirectHalf)"
     Write-Host "  Repeats:     $Repeats"
     Write-Host "  Output:      $OutputDirectory"
     Write-Host ""
@@ -408,6 +423,7 @@ finally {
 
     $env:FASTJXR_WORKERS = $oldWorkers
     $env:FASTJXR_PARTITION = $oldPartition
+    $env:FASTJXR_DIRECT_HALF = $oldDirectHalf
     $env:FASTJXR_TRACE = $oldTrace
     $env:FASTJXR_TRACE_FILE = $oldTraceFile
 }
