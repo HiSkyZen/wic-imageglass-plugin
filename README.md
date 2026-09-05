@@ -68,13 +68,15 @@ more workers are faster. The trace records both requested and actual worker coun
 
 Selects the full-resolution ROI scheduler:
 
-- `strip` (default): one full-width region per worker, aligned to 256-pixel tile rows.
-- `grid`: experimental 2D 256x256 tile work queue. Each worker owns an independent WIC decoder
-  and dynamically claims tiles. This can use more CPU threads when the image has fewer tile rows
-  than logical processors.
+- `strip` (default): one full-width region per worker. This is the proven fast path.
+- `column`: one full-height vertical band per worker. Like strip mode, each decoder performs
+  exactly one `CopyPixels` call; it is intended for landscape images with more tile columns
+  than tile rows.
+- `grid`: experimental 2D 256x256 tile work queue. Benchmarks on the current HDR corpus show
+  substantially higher overhead because each decoder performs many small ROI calls, so grid is
+  retained for diagnostics rather than used by default.
 
-Both modes preserve the original source resolution. Neither requests JPEG XR reduced-resolution
-decode.
+All modes preserve the original source resolution. None requests JPEG XR reduced-resolution decode.
 
 Example:
 
