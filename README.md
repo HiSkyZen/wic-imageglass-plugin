@@ -49,9 +49,11 @@ recent images, capped at 1.5 GiB total.
 
 Controls the maximum number of independent WIC decoder workers used for parallel ROI decoding.
 
-- Default: half of the logical processor count, clamped to 1-8.
-- Allowed override: `1` through `16`.
+- Default: all logical processors, clamped to 1-64.
+- Allowed override: `1` through `64`.
 - `FASTJXR_WORKERS=1` disables the parallel ROI attempt and uses the single-decoder path.
+- Strip mode cannot use more workers than the number of 256-pixel JPEG XR tile rows.
+- Grid mode can use horizontal tiles too, allowing more workers on wide/short images.
 
 Example:
 
@@ -59,9 +61,30 @@ Example:
 $env:FASTJXR_WORKERS = "8"
 ```
 
-For high-resolution tiled JXR files, try 4, 6, 8, 12, and 16 and compare actual latency.
-More workers are not guaranteed to be faster because memory bandwidth and decoder overhead
-eventually dominate.
+For high-resolution tiled JXR files, compare the actual measured latency rather than assuming
+more workers are faster. The trace records both requested and actual worker counts.
+
+### `FASTJXR_PARTITION`
+
+Selects the full-resolution ROI scheduler:
+
+- `strip` (default): one full-width region per worker, aligned to 256-pixel tile rows.
+- `grid`: experimental 2D 256x256 tile work queue. Each worker owns an independent WIC decoder
+  and dynamically claims tiles. This can use more CPU threads when the image has fewer tile rows
+  than logical processors.
+
+Both modes preserve the original source resolution. Neither requests JPEG XR reduced-resolution
+decode.
+
+Example:
+
+```powershell
+$env:FASTJXR_PARTITION = "grid"
+$env:FASTJXR_WORKERS = "24"
+```
+
+More workers are not guaranteed to be faster because decoder setup, tile scheduling and memory
+bandwidth eventually dominate.
 
 ### `FASTJXR_TRACE`
 
