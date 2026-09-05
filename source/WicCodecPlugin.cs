@@ -79,7 +79,10 @@ internal static unsafe class WicCodecPlugin
     private static IGStatus OnInitialize() => IGStatus.OK;
 
     [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
-    private static void OnShutdown() { }
+    private static void OnShutdown()
+    {
+        JxrDecodeCache.Clear();
+    }
 
 
     [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
