@@ -1,17 +1,14 @@
 name: Release
 
-# Manually triggered from the Actions tab. Native-AOT-publishes the plugin for both Windows
-# architectures, then creates a GitHub release with one fast-jxr-hdr_<version>_<arch>.igplugin.zip
-# per architecture attached. Each package holds a "Plugin_FastJxrHdrCodec" folder, which both
-# Settings > Plugins > Add and a manual copy into the _plugins directory accept.
-#
-# Windows only, by definition: the Windows Imaging Component is a Windows API.
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       version:
-        description: "Version to publish, e.g. 1.2.3 or 1.2.3-rc.1 (no leading 'v')"
-        required: true
+        description: "Optional version override, e.g. 1.3.0 (no leading v)"
+        required: false
         type: string
       prerelease:
         description: "Mark the GitHub release as a pre-release"
@@ -20,9 +17,8 @@ on:
         default: false
 
 permissions:
-  contents: write   # needed to create the git tag and GitHub release
+  contents: write
 
-# Never run two releases at once; don't cancel a publish that's in flight.
 concurrency:
   group: release
   cancel-in-progress: false
@@ -31,56 +27,80 @@ env:
   PLUGIN_FOLDER: Plugin_FastJxrHdrCodec
 
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      should_release: ${{ steps.meta.outputs.should_release }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve release metadata
+        id: meta
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MANUAL_VERSION: ${{ inputs.version || '' }}
+          MANUAL_PRERELEASE: ${{ inputs.prerelease || false }}
+        run: |
+          manifest_version="$(jq -r '.version' source/igplugin.json)"
+          version="${MANUAL_VERSION:-$manifest_version}"
+
+          if [[ -z "$version" || "$version" == "null" || "$version" == *"-dev"* ]]; then
+            echo "Refusing to release invalid version: $version"
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$MANUAL_PRERELEASE" >> "$GITHUB_OUTPUT"
+
+          if gh release view "v$version" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release v$version already exists; skipping duplicate publish."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
-    # Only allow releasing from main. Triggering from another branch is skipped.
-    if: github.ref == 'refs/heads/main'
+    needs: prepare
+    if: needs.prepare.outputs.should_release == 'true'
     strategy:
-      # Build both targets even if one fails, so a single run shows all the damage.
-      # The release job still requires both to succeed.
       fail-fast: false
       matrix:
         include:
-          - { rid: win-x64,   platform: x64,   arch: win-x64 }
+          - { rid: win-x64, platform: x64, arch: win-x64 }
           - { rid: win-arm64, platform: ARM64, arch: win-arm64 }
+
     runs-on: windows-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup .NET 10 SDK
-        uses: actions/setup-dotnet@v4
+      - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: 10.0.x
 
-      - name: Stamp the manifest version
-        # igplugin.json is what ImageGlass shows in Settings > Plugins, so keep it in
-        # step with the assembly version rather than letting the two drift.
+      - name: Stamp version
         shell: pwsh
         run: |
-          $path = "source/igplugin.json"
-          $manifest = Get-Content $path -Raw | ConvertFrom-Json
-          $manifest.version = "${{ inputs.version }}"
-          $manifest | ConvertTo-Json -Depth 5 | Set-Content $path -Encoding utf8
-          Get-Content $path
+          $version = "${{ needs.prepare.outputs.version }}"
+          $manifestPath = "source/igplugin.json"
+          $manifest = Get-Content $manifestPath -Raw | ConvertFrom-Json
+          $manifest.version = $version
+          $manifest | ConvertTo-Json -Depth 5 | Set-Content $manifestPath -Encoding utf8
 
-      - name: Publish (${{ matrix.rid }})
+      - name: Publish
         run: >
           dotnet publish source/WicCodec.csproj
           --configuration Release
           --runtime ${{ matrix.rid }}
           -p:Platform=${{ matrix.platform }}
-          -p:Version=${{ inputs.version }}
+          -p:Version=${{ needs.prepare.outputs.version }}
           --output dist/${{ matrix.rid }}
 
-      - name: Stage the plugin folder
-        # Lay the payload out as the folder users copy into ImageGlass's _plugins directory,
-        # minus three things:
-        #   - debug symbols (.pdb);
-        #   - libSkiaSharp: it rides along from the ImageGlass.SDK package reference, but this
-        #     plugin never calls Skia and ImageGlass ships its own copy next to the executable,
-        #     so a bundled second one is ~12 MB of dead weight;
-        #   - .xml: the SDK's IntelliSense docs, ~120 KB of nothing the host ever reads.
+      - name: Stage and verify plugin
         shell: pwsh
         run: |
           $staged = Join-Path "staging" $env:PLUGIN_FOLDER
@@ -89,57 +109,58 @@ jobs:
             Where-Object { $_.Extension -notin ".pdb", ".xml" } |
             Where-Object { $_.Name -notlike "libSkiaSharp*" } |
             Copy-Item -Destination $staged
-          Get-ChildItem $staged | Select-Object Name, Length
 
-      - name: Verify the package contents
-        # A package missing either file installs cleanly and then does nothing, so fail loudly here.
-        shell: pwsh
-        run: |
-          $staged = Join-Path "staging" $env:PLUGIN_FOLDER
           foreach ($required in "WicCodec.dll", "igplugin.json") {
             if (-not (Test-Path (Join-Path $staged $required))) {
               throw "package is missing $required"
             }
           }
 
-      - name: Pack fast-jxr-hdr_${{ inputs.version }}_${{ matrix.arch }}.igplugin.zip
+      - name: Pack
         shell: pwsh
-        run: Compress-Archive -Path "staging/$env:PLUGIN_FOLDER" -DestinationPath "fast-jxr-hdr_${{ inputs.version }}_${{ matrix.arch }}.igplugin.zip"
+        run: |
+          $version = "${{ needs.prepare.outputs.version }}"
+          Compress-Archive -Path "staging/$env:PLUGIN_FOLDER" -DestinationPath "fast-jxr-hdr_${version}_${{ matrix.arch }}.igplugin.zip"
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: fast-jxr-hdr_${{ matrix.arch }}
-          path: fast-jxr-hdr_${{ inputs.version }}_${{ matrix.arch }}.igplugin.zip
+          name: fast-jxr-hdr-${{ matrix.arch }}
+          path: fast-jxr-hdr_*.igplugin.zip
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 14
 
   release:
-    needs: build
+    needs: [prepare, build]
+    if: needs.prepare.outputs.should_release == 'true'
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # full history for release-note generation
+          fetch-depth: 0
 
-      - name: Download all platform packages
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
 
-      - name: List assets
-        run: ls -lh artifacts
-
       - name: Create GitHub release
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: >
-          gh release create "v${{ inputs.version }}"
-          artifacts/*.igplugin.zip
-          --target "${{ github.sha }}"
-          --title "v${{ inputs.version }}"
-          --generate-notes
-          ${{ inputs.prerelease && '--prerelease' || '' }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+        run: |
+          args=(
+            release create "v$VERSION"
+            artifacts/*.igplugin.zip
+            --target "${{ github.sha }}"
+            --title "Fast JXR HDR Codec v$VERSION"
+            --generate-notes
+          )
+
+          if [[ "$PRERELEASE" == "true" ]]; then
+            args+=(--prerelease)
+          fi
+
+          gh "${args[@]}"
