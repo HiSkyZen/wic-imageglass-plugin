@@ -19,7 +19,7 @@ internal static unsafe class WicCodecPlugin
 
     private const string PluginIdString = "Plugin_FastJxrHdrCodec";
     private const string PluginNameString = "Fast JXR HDR Codec";
-    private const string VersionString = "1.3.0-dev";
+    private const string VersionString = "1.3.1-dev";
     private const string CodecIdString = "plugin.fastjxr.hdr.codec";
     private const string CodecNameString = "Fast JXR HDR Codec";
 
