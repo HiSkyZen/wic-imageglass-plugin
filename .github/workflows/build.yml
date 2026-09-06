@@ -86,7 +86,7 @@ jobs:
               throw "package is missing $required"
             }
           }
-          Compress-Archive -Path $pluginDir -DestinationPath "artifacts/fast-jxr-hdr_1.3.0_${{ matrix.arch }}.igplugin.zip"
+          Compress-Archive -Path $pluginDir -DestinationPath "artifacts/fast-jxr-hdr_1.3.1_${{ matrix.arch }}.igplugin.zip"
 
       - name: Stage benchmark tool
         if: matrix.rid == 'win-x64'
