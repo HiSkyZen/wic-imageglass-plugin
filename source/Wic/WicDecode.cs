@@ -83,11 +83,30 @@ internal static unsafe class WicDecode
             outInfo->FrameCount = (int)frameCount;
             outInfo->FileSizeBytes = FileSizeOf(path);
 
+            // WIC float/fixed-point RGB formats are scRGB representations. Once pixels are
+            // exposed to ImageGlass as RGBA16F, their color semantics are therefore linear
+            // sRGB primaries regardless of any source-container ICC/EXIF hint. Advertising the
+            // original profile alongside already-scRGB pixels would make the host reinterpret
+            // the same numbers a second time and can reduce saturation or alter luminance.
+            var decodedAsScRgb = IsScRgbPlan(plan);
+            outInfo->ColorSpace = (int)(decodedAsScRgb
+                ? IGColorSpace.LinearSrgb
+                : IGColorSpace.Unknown);
+
             // The decoded buffer is already upright, so reporting the source tag would make a
             // host that honors it rotate a second time.
             outInfo->Orientation = 1;
 
-            ApplyColorProfile(factory, frame, outInfo, out var iccBytes);
+            byte[]? iccBytes = null;
+            if (!decodedAsScRgb)
+            {
+                ApplyColorProfile(factory, frame, outInfo, out iccBytes);
+            }
+            else if (FastJxrTrace.Enabled)
+            {
+                FastJxrTrace.Info("metadata color policy: RGBA16F linear-scRGB; source ICC/EXIF suppressed");
+            }
+
             JxrMetadataCache.Store(path, outInfo, iccBytes, sourceFormat, orientation);
             FastJxrTrace.End("metadata WIC load", traceStart);
             return IGStatus.OK;
@@ -795,6 +814,19 @@ internal static unsafe class WicDecode
     /// <summary>
     /// Publishes the frame's embedded ICC profile, or falls back to its EXIF color-space tag.
     /// </summary>
+    /// <summary>
+    /// Returns true when the host-facing half-float buffer carries WIC scRGB samples.
+    /// <para>
+    /// On older ImageGlass ABI versions the transfer function is reported as Linear because
+    /// IGHdrTransferFn.ScRgb did not exist yet; the pixel representation is still scRGB.
+    /// HDR10 is excluded because its half-float conversion retains PQ semantics instead.
+    /// </para>
+    /// </summary>
+    private static bool IsScRgbPlan(in PixelPlan plan)
+        => plan.IgFormat == IGPixelFormat.RgbaFloat16
+            && plan.Hdr is IGHdrTransferFn.ScRgb or IGHdrTransferFn.Linear;
+
+
     private static void ApplyColorProfile(IWICImagingFactory* factory, IWICBitmapFrameDecode* frame,
         IGImageInfo* outInfo, out byte[]? iccBytes)
     {
