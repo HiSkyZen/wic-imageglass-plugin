@@ -1,137 +1,108 @@
 # Fast JXR HDR Codec for ImageGlass
 
-A performance-focused **full-resolution JPEG XR HDR** codec plugin for ImageGlass 10 on Windows.
+A performance-focused **full-resolution JPEG XR HDR decoder** for ImageGlass 10 on Windows.
 
-This fork is specialized for `.jxr`, `.wdp`, and `.hdp`. It intentionally gives up the
-upstream plugin's general-purpose WIC format/encoding support in exchange for a narrower and
-more aggressive JPEG XR decode path.
+This fork specializes the upstream WIC plugin for `.jxr`, `.wdp`, and `.hdp` and prioritizes
+low first-open latency for large HDR JPEG XR files.
 
-## Goals
+**Reduced-resolution JPEG XR decoding is deliberately not exposed.**
 
-- Always decode the requested JPEG XR image at **full source resolution**.
-- Reduce the latency of large HDR JPEG XR files, especially
-  `GUID_WICPixelFormat128bppRGBAFloat` sources.
-- Spend additional CPU cores and RAM when doing so lowers wall-clock latency.
-- Preserve ImageGlass's RGBA16F/scRGB HDR path.
-- Keep a conservative WIC fallback when an optimized path cannot be used.
+## Release 1.3.0
 
-**Reduced-resolution JPEG XR decoding is deliberately disabled.**
+The production fast path is intentionally narrow:
 
-## Fast paths
+1. Open the Windows JPEG XR / WMP decoder directly instead of generic WIC codec discovery.
+2. Detect `128bpp RGBA Float` HDR sources without generic pixel-format probing.
+3. Parse the JPEG XR codestream header and recover the **exact physical tile-row boundaries**.
+4. Decode independent full-resolution tile-row ROIs concurrently with separate WIC decoder instances.
+5. Convert each native RGBA32F region to ImageGlass `RGBA16F` with
+   `System.Numerics.Tensors.TensorPrimitives.ConvertToHalf`.
+6. Fall back to a conservative single-decoder full-resolution path when the parallel path is unavailable.
+7. Cache recent decoded RGBA16F images with zero-copy reference counting and cache metadata separately.
 
-For the 128bpp RGBA-float HDR files this fork targets:
+Experimental grid, column, weighted-hybrid, and direct-half schedulers remain on the development
+branch and are not part of the stable 1.3.0 release path.
 
-1. Open the WIC JPEG XR/WMP decoder directly instead of performing generic codec discovery.
-2. Request native `128bpp RGBA Float` pixels, bypassing WIC's generic FP32 -> FP16 converter.
-3. Attempt **parallel full-resolution ROI decoding** with independent WIC decoder instances.
-   JPEG XR's tiled representation allows regions to be decoded independently.
-4. Convert each decoded region from FP32 to ImageGlass `RGBA16F` with
-   `System.Numerics.Tensors.TensorPrimitives.ConvertToHalf` and multiple CPU cores.
-5. If parallel ROI decoding is rejected by the installed codec, fall back to one native
-   full-resolution decode followed by parallel/vectorized FP32 -> FP16 conversion.
-6. Cache recent full-resolution RGBA16F results and metadata so duplicate ImageGlass requests
-   do not repeat an expensive JPEG XR decode.
+## Measured performance
 
-The NativeAOT build uses `OptimizationPreference=Speed`.
+Reference system: Intel Core i7-13700K, Windows, ImageGlass 10.
+
+| HDR JXR | Resolution | Single decoder | Stable exact-tile strip |
+|---|---:|---:|---:|
+| Austin Laser | 5456 × 3632 | ~0.90 s | ~0.11–0.12 s |
+| Big Sur Coastline | 6016 × 6016 | ~1.65 s | ~0.18–0.19 s |
+
+Actual performance depends on JPEG XR tile layout, compressed complexity, CPU topology, storage,
+and the installed Windows Imaging Component decoder.
 
 ## Memory trade-off
 
-The plugin is intentionally latency-oriented. A 6016 x 6016 128bpp RGBA-float image is about
-552 MiB when expanded to FP32 and about 276 MiB as the RGBA16F buffer handed to ImageGlass.
+The codec is latency-oriented and intentionally spends RAM to reduce wall-clock time.
 
-Parallel ROI decoding avoids one monolithic FP32 temporary, but several per-region FP32
-temporaries can be resident at once. The full-resolution pixel cache can retain up to three
-recent images, capped at 1.5 GiB total.
+A 6016 × 6016 RGBA32F raster is roughly 552 MiB and the final RGBA16F ImageGlass buffer is roughly
+276 MiB. Parallel workers hold disjoint temporary regions rather than one temporary per full image.
+
+The decoded-image cache keeps up to three recent outputs with a 1.5 GiB total cap.
 
 ## Tuning
 
 ### `FASTJXR_WORKERS`
 
-Controls the maximum number of independent WIC decoder workers used for parallel ROI decoding.
+Maximum number of independent WIC decoder workers.
 
-- Default: all logical processors, clamped to 1-64.
+- Default: all logical processors, capped at 64.
 - Allowed override: `1` through `64`.
-- `FASTJXR_WORKERS=1` disables the parallel ROI attempt and uses the single-decoder path.
-- Strip mode cannot use more workers than the number of 256-pixel JPEG XR tile rows.
-- Grid mode can use horizontal tiles too, allowing more workers on wide/short images.
+- The actual count is capped by the number of physical JPEG XR tile rows.
+- `FASTJXR_WORKERS=1` uses the single-decoder fallback.
 
 Example:
 
 ```powershell
-$env:FASTJXR_WORKERS = "8"
-```
-
-For high-resolution tiled JXR files, compare the actual measured latency rather than assuming
-more workers are faster. The trace records both requested and actual worker counts.
-
-### `FASTJXR_PARTITION`
-
-Selects the full-resolution ROI scheduler:
-
-- `strip` (default): one full-width region per worker. This is the proven fast path.
-- `column`: one full-height vertical band per worker. Like strip mode, each decoder performs
-  exactly one `CopyPixels` call; it is intended for landscape images with more tile columns
-  than tile rows.
-- `grid`: experimental 2D 256x256 tile work queue. Benchmarks on the current HDR corpus show
-  substantially higher overhead because each decoder performs many small ROI calls, so grid is
-  retained for diagnostics rather than used by default.
-
-All modes preserve the original source resolution. None requests JPEG XR reduced-resolution decode.
-
-Example:
-
-```powershell
-$env:FASTJXR_PARTITION = "grid"
 $env:FASTJXR_WORKERS = "24"
 ```
 
-More workers are not guaranteed to be faster because decoder setup, tile scheduling and memory
-bandwidth eventually dominate.
-
 ### `FASTJXR_TRACE`
 
-Set to `1` to emit timing information through ImageGlass's plugin log channel.
+Set to `1` to enable timing diagnostics.
 
 ```powershell
 $env:FASTJXR_TRACE = "1"
 ```
 
-The trace reports metadata/cache hits, total full-resolution decode latency, and whether the
-parallel ROI or sequential fallback path was used.
+### `FASTJXR_TRACE_FILE`
 
-## Supported formats
+Optional path for structured benchmark trace output.
 
-| Operation | Formats |
+```powershell
+$env:FASTJXR_TRACE_FILE = "C:\\Temp\\fastjxr.log"
+```
+
+## Supported operations
+
+| Operation | Support |
 |---|---|
-| Decode | `.jxr`, `.wdp`, `.hdp` |
-| Encode | Not supported |
-| Reduced-resolution decode | **Not supported** |
+| Decode `.jxr`, `.wdp`, `.hdp` | Yes |
+| HDR RGBA16F/scRGB output | Yes |
+| Encode | No |
+| Reduced-resolution decode callback | No |
 
 ## Build
 
 Requires the .NET 10 SDK and Visual Studio C++ build tools for NativeAOT.
 
 ```powershell
-# NativeAOT x64
 dotnet publish source/WicCodec.csproj -c Release -r win-x64 -p:Platform=x64
-
-# Package
 ./pack.ps1 -Rid win-x64
-
-# Build and deploy directly to ImageGlass for local testing
-./pack.ps1 -Rid win-x64 -Deploy
 ```
 
-The deployed plugin lives in a separate `Plugin_FastJxrHdrCodec` directory, so it does not
-overwrite the upstream general-purpose WIC plugin.
+The plugin installs into `Plugin_FastJxrHdrCodec`, separately from the upstream generic WIC plugin.
 
-## CI
+## Credits
 
-Pushes to `dev/**` NativeAOT-publish the x64 plugin and upload the result as a workflow artifact.
-
-## Upstream
-
-Based on [d2phap/wic-imageglass-plugin](https://github.com/d2phap/wic-imageglass-plugin).
+- Original WIC ImageGlass plugin: **Duong Dieu Phap** — d2phap/wic-imageglass-plugin
+- Fast JXR specialization, parallel HDR path, exact-tile scheduling, caching and benchmarking:
+  **HiSkyZen**
+- ImageGlass and its native codec plugin ABI: ImageGlass project contributors
 
 ## License
 
