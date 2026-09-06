@@ -26,12 +26,13 @@
     <RootNamespace>WicCodec</RootNamespace>
 
     <!-- Keep in sync with "version" in igplugin.json. -->
-    <Version>1.3.0-dev</Version>
+    <Version>1.3.0</Version>
     <Product>Fast JXR HDR Codec for ImageGlass</Product>
-    <Authors>Duong Dieu Phap</Authors>
-    <Copyright>Copyright (C) 2026 Duong Dieu Phap</Copyright>
+    <Authors>Duong Dieu Phap;HiSkyZen</Authors>
+    <Copyright>Copyright (C) 2026 Duong Dieu Phap and HiSkyZen</Copyright>
 
     <!-- Plugin library: not a NuGet package. -->
+    <RepositoryUrl>https://github.com/HiSkyZen/wic-imageglass-plugin</RepositoryUrl>
     <IsPackable>false</IsPackable>
   </PropertyGroup>
 
