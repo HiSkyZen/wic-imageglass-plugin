@@ -1,9 +1,9 @@
 {
   "id": "Plugin_FastJxrHdrCodec",
   "name": "Fast JXR HDR Codec",
-  "description": "Performance-focused full-resolution JPEG XR HDR decoder for ImageGlass. Supports .jxr, .hdp and .wdp; reduced-resolution decoding is intentionally disabled.",
-  "version": "1.3.0-dev",
-  "author": "Duong Dieu Phap",
+  "description": "High-performance full-resolution JPEG XR HDR decoder for ImageGlass with exact-tile parallel decoding. Supports .jxr, .hdp and .wdp.",
+  "version": "1.3.0",
+  "author": "Duong Dieu Phap, HiSkyZen",
   "website": "https://github.com/HiSkyZen/wic-imageglass-plugin",
   "kind": "Codec",
   "executable": "WicCodec.dll"
