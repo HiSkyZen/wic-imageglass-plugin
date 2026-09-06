@@ -1,9 +1,9 @@
 <#
 .SYNOPSIS
-    Publishes the WIC codec plugin and packs it as wic-codec_<arch>.igplugin.zip.
+    Publishes the Fast JXR HDR codec plugin and packs it as fast-jxr-hdr_<arch>.igplugin.zip.
 
 .DESCRIPTION
-    Produces the same layout as the release workflow: a single "Plugin_WicCodec" folder
+    Produces a single "Plugin_FastJxrHdrCodec" folder
     holding the native library and its manifest. ImageGlass accepts that either through
     Settings > Plugins > Add or as a manual copy into the _plugins directory.
 
@@ -24,7 +24,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
-$pluginFolder = 'Plugin_WicCodec'
+$pluginFolder = 'Plugin_FastJxrHdrCodec'
 
 # ILCompiler shells out to vcvarsall.bat, which calls vswhere.exe by bare name. Outside a
 # Developer Command Prompt that failure is captured into the linker path and the native link
@@ -71,7 +71,7 @@ foreach ($runtime in $Rid) {
         }
     }
 
-    $zip = Join-Path $root "dist/wic-codec_${version}_$runtime.igplugin.zip"
+    $zip = Join-Path $root "dist/fast-jxr-hdr_${version}_$runtime.igplugin.zip"
     if (Test-Path $zip) { Remove-Item $zip -Force }
     Compress-Archive -Path $staged -DestinationPath $zip
 

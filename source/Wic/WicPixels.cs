@@ -43,6 +43,16 @@ internal static unsafe class WicPixels
     /// </summary>
     public static PixelPlan Choose(IWICImagingFactory* factory, Guid sourceFormat)
     {
+        // Hot JXR paths: avoid COM component-info probing for the two HDR layouts we care about.
+        // The sample corpus produced by the SDR->HDR pipeline is 128bpp RGBA float.
+        if (sourceFormat == Apis.GUID_WICPixelFormat128bppRGBAFloat
+            || sourceFormat == Apis.GUID_WICPixelFormat64bppRGBAHalf)
+        {
+            var extendedFn = HostSupportsScRgb ? IGHdrTransferFn.ScRgb : IGHdrTransferFn.Linear;
+            return new PixelPlan(Apis.GUID_WICPixelFormat64bppRGBAHalf,
+                IGPixelFormat.RgbaFloat16, 8, extendedFn, true);
+        }
+
         // HDR10 is the one format whose transfer function is not implied by its numeric
         // representation: 10-bit unsigned integers carrying PQ-encoded values.
         if (sourceFormat == Apis.GUID_WICPixelFormat32bppR10G10B10A2HDR10)

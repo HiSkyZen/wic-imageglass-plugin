@@ -1,0 +1,103 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - "dev/**"
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build-windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { rid: win-x64, platform: x64, arch: win-x64 }
+          - { rid: win-arm64, platform: ARM64, arch: win-arm64 }
+
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: Validate benchmark script syntax
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path "bench-fastjxr.ps1"),
+            [ref]$tokens,
+            [ref]$errors
+          ) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | Format-List *
+            throw "bench-fastjxr.ps1 has PowerShell syntax errors"
+          }
+
+      - name: Verify stable decoder surface
+        shell: pwsh
+        run: |
+          $paths = @("source/Wic/WicDecode.cs", "bench-fastjxr.ps1")
+          $forbidden = @(
+            "FASTJXR_PARTITION",
+            "FASTJXR_DIRECT_HALF",
+            "TryDecodeRgbaFloat32Columns",
+            "TryDecodeRgbaFloat32TileGrid",
+            "BuildWeightedHybridTasks"
+          )
+          foreach ($token in $forbidden) {
+            $hit = Select-String -Path $paths -Pattern $token -SimpleMatch
+            if ($hit) {
+              $hit | Format-Table Path, LineNumber, Line -AutoSize
+              throw "experimental release token remains: $token"
+            }
+          }
+
+      - name: Restore
+        run: dotnet restore source/WicCodec.csproj -r ${{ matrix.rid }}
+
+      - name: Publish NativeAOT
+        run: >
+          dotnet publish source/WicCodec.csproj
+          -c Release
+          -r ${{ matrix.rid }}
+          -p:Platform=${{ matrix.platform }}
+          --no-restore
+          -o artifacts/publish
+
+      - name: Pack installable plugin
+        shell: pwsh
+        run: |
+          $pluginDir = "artifacts/package/Plugin_FastJxrHdrCodec"
+          New-Item -ItemType Directory -Force -Path $pluginDir | Out-Null
+          Get-ChildItem "artifacts/publish" -File |
+            Where-Object { $_.Extension -notin ".pdb", ".xml" } |
+            Where-Object { $_.Name -notlike "libSkiaSharp*" } |
+            Copy-Item -Destination $pluginDir
+          foreach ($required in "WicCodec.dll", "igplugin.json") {
+            if (-not (Test-Path (Join-Path $pluginDir $required))) {
+              throw "package is missing $required"
+            }
+          }
+          Compress-Archive -Path $pluginDir -DestinationPath "artifacts/fast-jxr-hdr_1.3.0_${{ matrix.arch }}.igplugin.zip"
+
+      - name: Stage benchmark tool
+        if: matrix.rid == 'win-x64'
+        shell: pwsh
+        run: Copy-Item bench-fastjxr.ps1 artifacts/bench-fastjxr.ps1
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: fast-jxr-hdr-${{ matrix.arch }}
+          path: |
+            artifacts/*.igplugin.zip
+            artifacts/bench-fastjxr.ps1
+          if-no-files-found: error

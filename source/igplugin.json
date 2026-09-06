@@ -1,10 +1,10 @@
 {
-  "id": "Plugin_WicCodec",
-  "name": "WIC Codec",
-  "description": "Reads and writes every image format the WIC (Windows Imaging Component) has a codec for, including JPEG XR (.jxr, .hdp, .wdp) and any WIC codec you install from the Microsoft Store.",
-  "version": "1.2.0",
-  "author": "Duong Dieu Phap",
-  "website": "https://github.com/d2phap/wic-imageglass-plugin",
+  "id": "Plugin_FastJxrHdrCodec",
+  "name": "Fast JXR HDR Codec",
+  "description": "High-performance full-resolution JPEG XR HDR decoder for ImageGlass with exact-tile parallel decoding. Supports .jxr, .hdp and .wdp.",
+  "version": "1.3.0",
+  "author": "Duong Dieu Phap, HiSkyZen",
+  "website": "https://github.com/HiSkyZen/wic-imageglass-plugin",
   "kind": "Codec",
   "executable": "WicCodec.dll"
 }

@@ -1,51 +1,108 @@
-# WIC Codec for ImageGlass
+# Fast JXR HDR Codec for ImageGlass
 
-Brings the **Windows Imaging Component** into ImageGlass as a native codec plugin: every
-image format your copy of Windows has a codec registered for becomes readable and writable,
-including **JPEG XR (`.jxr`, `.hdp`, `.wdp`)**, which none of ImageGlass's built-in codecs
-handle.
+A performance-focused **full-resolution JPEG XR HDR decoder** for ImageGlass 10 on Windows.
 
-Built with [Vortice.Win32.Graphics.Imaging](https://github.com/amerkoleci/Vortice.Win32) and
-compiled with Native AOT for Windows x64 and ARM64.
+This fork specializes the upstream WIC plugin for `.jxr`, `.wdp`, and `.hdp` and prioritizes
+low first-open latency for large HDR JPEG XR files.
 
+**Reduced-resolution JPEG XR decoding is deliberately not exposed.**
 
-## Supported Formats
+## Release 1.3.0
 
-The format list is **not hardcoded**. At startup the plugin enumerates the WIC component
-registry, so whatever codecs the machine has – shipped with Windows, installed from the
-Microsoft Store, or third-party – show up automatically.
+The production fast path is intentionally narrow:
 
-On a stock Windows 11 machine with the Store codec extensions installed, that is 66 readable
-and 20 writable extensions:
+1. Open the Windows JPEG XR / WMP decoder directly instead of generic WIC codec discovery.
+2. Detect `128bpp RGBA Float` HDR sources without generic pixel-format probing.
+3. Parse the JPEG XR codestream header and recover the **exact physical tile-row boundaries**.
+4. Decode independent full-resolution tile-row ROIs concurrently with separate WIC decoder instances.
+5. Convert each native RGBA32F region to ImageGlass `RGBA16F` with
+   `System.Numerics.Tensors.TensorPrimitives.ConvertToHalf`.
+6. Fall back to a conservative single-decoder full-resolution path when the parallel path is unavailable.
+7. Cache recent decoded RGBA16F images with zero-copy reference counting and cache metadata separately.
 
-| | |
+Experimental grid, column, weighted-hybrid, and direct-half schedulers remain on the development
+branch and are not part of the stable 1.3.0 release path.
+
+## Measured performance
+
+Reference system: Intel Core i7-13700K, Windows, ImageGlass 10.
+
+| HDR JXR | Resolution | Single decoder | Stable exact-tile strip |
+|---|---:|---:|---:|
+| Austin Laser | 5456 × 3632 | ~0.90 s | ~0.11–0.12 s |
+| Big Sur Coastline | 6016 × 6016 | ~1.65 s | ~0.18–0.19 s |
+
+Actual performance depends on JPEG XR tile layout, compressed complexity, CPU topology, storage,
+and the installed Windows Imaging Component decoder.
+
+## Memory trade-off
+
+The codec is latency-oriented and intentionally spends RAM to reduce wall-clock time.
+
+A 6016 × 6016 RGBA32F raster is roughly 552 MiB and the final RGBA16F ImageGlass buffer is roughly
+276 MiB. Parallel workers hold disjoint temporary regions rather than one temporary per full image.
+
+The decoded-image cache keeps up to three recent outputs with a 1.5 GiB total cap.
+
+## Tuning
+
+### `FASTJXR_WORKERS`
+
+Maximum number of independent WIC decoder workers.
+
+- Default: all logical processors, capped at 64.
+- Allowed override: `1` through `64`.
+- The actual count is capped by the number of physical JPEG XR tile rows.
+- `FASTJXR_WORKERS=1` uses the single-decoder fallback.
+
+Example:
+
+```powershell
+$env:FASTJXR_WORKERS = "24"
+```
+
+### `FASTJXR_TRACE`
+
+Set to `1` to enable timing diagnostics.
+
+```powershell
+$env:FASTJXR_TRACE = "1"
+```
+
+### `FASTJXR_TRACE_FILE`
+
+Optional path for structured benchmark trace output.
+
+```powershell
+$env:FASTJXR_TRACE_FILE = "C:\\Temp\\fastjxr.log"
+```
+
+## Supported operations
+
+| Operation | Support |
 |---|---|
-| **Read** | `.bmp` `.dib` `.rle` `.gif` `.ico` `.icon` `.cur` `.jpeg` `.jpe` `.jpg` `.jfif` `.exif` `.png` `.tiff` `.tif` `.dng` `.wdp` `.jxr` `.hdp` `.dds` `.heic` `.heif` `.hif` `.avci` `.heics` `.heifs` `.avcs` `.avif` `.avifs` `.webp` `.jxl` + camera raw (`.3fr` `.ari` `.arw` `.bay` `.cap` `.cr2` `.cr3` `.crw` `.dcs` `.dcr` `.drf` `.eip` `.erf` `.fff` `.iiq` `.k25` `.kdc` `.mef` `.mos` `.mrw` `.nef` `.nrw` `.orf` `.ori` `.pef` `.ptx` `.pxn` `.raf` `.raw` `.rw2` `.rwl` `.sr2` `.srf` `.srw` `.x3f`) |
-| **Write** | `.bmp` `.dib` `.rle` `.gif` `.jpeg` `.jpe` `.jpg` `.jfif` `.exif` `.png` `.tiff` `.tif` `.wdp` `.jxr` `.hdp` `.dds` `.heic` `.heif` `.hif` `.jxl` |
-
-
-## Install
-
-1. Download `wic-codec_<version>_win-x64.igplugin.zip` (or `win-arm64`) from
-   [Releases](https://github.com/d2phap/wic-imageglass-plugin/releases).
-2. ImageGlass → **Settings → Plugins → Add**, and pick the `.igplugin.zip`.
-3. Click **Trust and enable**.
-
+| Decode `.jxr`, `.wdp`, `.hdp` | Yes |
+| HDR RGBA16F/scRGB output | Yes |
+| Encode | No |
+| Reduced-resolution decode callback | No |
 
 ## Build
 
-Requires the .NET 10 SDK and the Visual Studio C++ build tools (Native AOT links natively).
+Requires the .NET 10 SDK and Visual Studio C++ build tools for NativeAOT.
 
 ```powershell
-# compile only – quick syntax check
-dotnet build source/WicCodec.csproj -c Debug -p:Platform=x64
-
-# publish + pack both architectures into dist/wic-codec_<version>_<arch>.igplugin.zip
-./pack.ps1
-
-# publish x64 and drop it straight into %LOCALAPPDATA%\ImageGlass\_plugins
-./pack.ps1 -Rid win-x64 -Deploy
+dotnet publish source/WicCodec.csproj -c Release -r win-x64 -p:Platform=x64
+./pack.ps1 -Rid win-x64
 ```
+
+The plugin installs into `Plugin_FastJxrHdrCodec`, separately from the upstream generic WIC plugin.
+
+## Credits
+
+- Original WIC ImageGlass plugin: **Duong Dieu Phap** — d2phap/wic-imageglass-plugin
+- Fast JXR specialization, parallel HDR path, exact-tile scheduling, caching and benchmarking:
+  **HiSkyZen**
+- ImageGlass and its native codec plugin ABI: ImageGlass project contributors
 
 ## License
 
