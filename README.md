@@ -7,7 +7,13 @@ low first-open latency for large HDR JPEG XR files.
 
 **Reduced-resolution JPEG XR decoding is deliberately not exposed.**
 
-## Release 1.3.0
+## Release 1.3.1
+
+In addition to the 1.3.0 decode optimizations, the codec now normalizes WIC extended-range
+float/fixed-point output explicitly as **linear scRGB** when handing RGBA16F pixels to ImageGlass.
+For those buffers, source-container ICC/EXIF color hints are intentionally not re-published:
+the decoded pixel representation already defines scRGB semantics, and retaining the original
+profile can cause the host to reinterpret already-converted pixel values.
 
 The production fast path is intentionally narrow:
 
